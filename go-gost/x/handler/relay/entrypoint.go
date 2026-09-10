@@ -113,7 +113,7 @@ func (h *tcpHandler) Handle(ctx context.Context, conn net.Conn, opts ...handler.
 
 	t := time.Now()
 	log.Debugf("%s <-> %s", conn.RemoteAddr(), cc.RemoteAddr())
-	xnet.Transport(conn, cc)
+	xnet.TransportWithIdleTimeout(conn, cc, int(h.md.idleTimeout.Seconds()))
 	log.WithFields(map[string]any{"duration": time.Since(t)}).
 		Debugf("%s >-< %s", conn.RemoteAddr(), cc.RemoteAddr())
 	return nil

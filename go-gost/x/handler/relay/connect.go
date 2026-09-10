@@ -199,7 +199,7 @@ func (h *relayHandler) handleConnect(ctx context.Context, conn net.Conn, network
 
 	t := time.Now()
 	log.Infof("%s <-> %s", conn.RemoteAddr(), address)
-	xnet.Transport(conn, cc)
+	xnet.TransportWithIdleTimeout(conn, cc, int(h.md.idleTimeout.Seconds()))
 	log.WithFields(map[string]any{
 		"duration": time.Since(t),
 	}).Infof("%s >-< %s", conn.RemoteAddr(), address)

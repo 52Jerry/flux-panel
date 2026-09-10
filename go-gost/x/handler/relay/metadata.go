@@ -14,7 +14,8 @@ import (
 )
 
 type metadata struct {
-	readTimeout time.Duration
+	readTimeout  time.Duration
+	idleTimeout time.Duration // data transfer idle timeout (seconds)
 	enableBind  bool
 	noDelay     bool
 	hash        string
@@ -41,6 +42,14 @@ func (h *relayHandler) parseMetadata(md mdata.Metadata) (err error) {
 	h.md.readTimeout = mdutil.GetDuration(md, "readTimeout")
 	if h.md.readTimeout <= 0 {
 		h.md.readTimeout = 15 * time.Second
+	}
+
+	// idleTimeout: close relay connections after this many seconds of
+	// inactivity during data transfer. Default 300s (5 min) to catch
+	// dead residential SOCKS proxies without killing long-lived tunnels.
+	h.md.idleTimeout = mdutil.GetDuration(md, "idleTimeout")
+	if h.md.idleTimeout <= 0 {
+		h.md.idleTimeout = 300 * time.Second
 	}
 
 	h.md.enableBind = mdutil.GetBool(md, "bind")

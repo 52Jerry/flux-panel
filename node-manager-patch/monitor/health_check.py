@@ -113,11 +113,11 @@ def _health_check_loop(interval: int, fail_threshold: int, tcp_timeout: float, b
                             failed += 1
                             if _failure_counts[tag] >= fail_threshold:
                                 dead_info = {
-                                    "user_id": user_id,
+                                    "userId": user_id,
                                     "tag": tag,
                                     "server": ob["server"],
                                     "port": ob["port"],
-                                    "fail_count": _failure_counts[tag],
+                                    "failCount": _failure_counts[tag],
                                 }
                                 newly_dead.append(dead_info)
                                 _dead_outbounds.append(dead_info)

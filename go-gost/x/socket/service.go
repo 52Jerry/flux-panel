@@ -87,7 +87,22 @@ func updateServices(req updateServicesRequest) error {
 		return errors.New("services list cannot be empty")
 	}
 
-	// 第一阶段：验证所有服务存在
+	// 第一阶段：验证所有服务存在，并预先解析所有新配置
+	type serviceUpdate struct {
+		name       string
+		oldService service.Service
+		oldConfig  *config.ServiceConfig
+		newConfig  config.ServiceConfig
+		newService service.Service
+	}
+	var updates []serviceUpdate
+
+	// 建立 name -> 旧配置 的映射
+	oldConfigMap := make(map[string]*config.ServiceConfig)
+	for _, s := range config.Global().Services {
+		oldConfigMap[s.Name] = s
+	}
+
 	for _, serviceConfig := range req.Data {
 		name := strings.TrimSpace(serviceConfig.Name)
 		if name == "" {
@@ -99,44 +114,51 @@ func updateServices(req updateServicesRequest) error {
 		if old == nil {
 			return errors.New("service " + name + " not found")
 		}
-	}
 
-	// 第二阶段：按照原来的updateService逻辑，逐个更新服务
-	for _, serviceConfig := range req.Data {
-		name := strings.TrimSpace(serviceConfig.Name)
-		serviceConfig.Name = name
-
-		// 1. 获取旧服务
-		old := registry.ServiceRegistry().Get(name)
-
-		// 2. 关闭旧服务
-		old.Close()
-
-		// 3. 从注册表移除旧服务
-		registry.ServiceRegistry().Unregister(name)
-
-		// 4. 解析新服务配置
+		// 预先解析新配置，确保全部合法后再执行更新
 		svc, err := parser.ParseService(&serviceConfig)
 		if err != nil {
 			return errors.New("create service " + name + " failed: " + err.Error())
 		}
 
-		// 5. 注册新服务
-		if err := registry.ServiceRegistry().Register(name, svc); err != nil {
-			svc.Close()
-			return errors.New("service " + name + " already exists")
+		updates = append(updates, serviceUpdate{
+			name:       name,
+			oldService: old,
+			oldConfig:  oldConfigMap[name],
+			newConfig:  serviceConfig,
+			newService: svc,
+		})
+	}
+
+	// 第二阶段：逐个更新服务，失败则回滚
+	var completed []serviceUpdate
+	for _, u := range updates {
+		// 1. 关闭旧服务（会等待 Serve() 退出）
+		u.oldService.Close()
+
+		// 2. 从注册表移除旧服务
+		registry.ServiceRegistry().Unregister(u.name)
+
+		// 3. 注册新服务
+		if err := registry.ServiceRegistry().Register(u.name, u.newService); err != nil {
+			u.newService.Close()
+			// 回滚已完成的更新
+			rollbackUpdatedServices(completed)
+			return errors.New("service " + u.name + " already exists")
 		}
 
-		// 6. 启动新服务
-		go svc.Serve()
+		// 4. 启动新服务
+		go u.newService.Serve()
+
+		completed = append(completed, u)
 	}
 
 	// 第三阶段：更新配置
 	config.OnUpdate(func(c *config.Config) error {
-		for _, serviceConfig := range req.Data {
+		for _, u := range updates {
 			for i := range c.Services {
-				if c.Services[i].Name == serviceConfig.Name {
-					c.Services[i] = &serviceConfig
+				if c.Services[i].Name == u.name {
+					c.Services[i] = &u.newConfig
 					break
 				}
 			}
@@ -145,6 +167,30 @@ func updateServices(req updateServicesRequest) error {
 	})
 
 	return nil
+}
+
+func rollbackUpdatedServices(completed []serviceUpdate) {
+	for _, u := range completed {
+		// 关闭新服务
+		if svc := registry.ServiceRegistry().Get(u.name); svc != nil {
+			svc.Close()
+		}
+		registry.ServiceRegistry().Unregister(u.name)
+
+		// 用旧配置重新创建并启动服务
+		if u.oldConfig == nil {
+			continue
+		}
+		oldSvc, err := parser.ParseService(u.oldConfig)
+		if err != nil {
+			continue
+		}
+		if err := registry.ServiceRegistry().Register(u.name, oldSvc); err != nil {
+			oldSvc.Close()
+			continue
+		}
+		go oldSvc.Serve()
+	}
 }
 
 func deleteServices(req deleteServicesRequest) error {

@@ -226,19 +226,18 @@ func updateService(ctx *gin.Context) {
 		writeError(ctx, NewError(http.StatusBadRequest, ErrCodeNotFound, fmt.Sprintf("service %s not found", name)))
 		return
 	}
-	old.Close()
-	registry.ServiceRegistry().Unregister(name)
-
-	// 等待端口释放
-	time.Sleep(500 * time.Millisecond)
 
 	req.Data.Name = name
 
+	// 先解析新配置，确保合法后再关闭旧服务（避免解析失败导致服务消失）
 	svc, err := parser.ParseService(&req.Data)
 	if err != nil {
 		writeError(ctx, NewError(http.StatusInternalServerError, ErrCodeFailed, fmt.Sprintf("create service %s failed: %s", name, err.Error())))
 		return
 	}
+
+	old.Close()
+	registry.ServiceRegistry().Unregister(name)
 
 	if err := registry.ServiceRegistry().Register(name, svc); err != nil {
 		svc.Close()

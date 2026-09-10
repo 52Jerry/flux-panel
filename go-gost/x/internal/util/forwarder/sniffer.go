@@ -580,7 +580,7 @@ func (h *Sniffer) handleUpgradeResponse(ctx context.Context, rw io.ReadWriter, c
 }
 
 func (h *Sniffer) sniffingWebsocketFrame(ctx context.Context, rw, cc io.ReadWriter, ro *xrecorder.HandlerRecorderObject, log logger.Logger) error {
-	errc := make(chan error, 1)
+	errc := make(chan error, 2) // buffer 2: both goroutines can always send
 
 	sampleRate := h.WebsocketSampleRate
 	if sampleRate == 0 {
@@ -602,6 +602,10 @@ func (h *Sniffer) sniffingWebsocketFrame(ctx context.Context, rw, cc io.ReadWrit
 			start := time.Now()
 
 			if err := h.copyWebsocketFrame(cc, rw, buf, "client", ro); err != nil {
+				// Close the peer to interrupt the other goroutine.
+				if c, ok := rw.(io.Closer); ok {
+					c.Close()
+				}
 				errc <- err
 				return
 			}
@@ -628,6 +632,10 @@ func (h *Sniffer) sniffingWebsocketFrame(ctx context.Context, rw, cc io.ReadWrit
 			start := time.Now()
 
 			if err := h.copyWebsocketFrame(rw, cc, buf, "server", ro); err != nil {
+				// Close the peer to interrupt the other goroutine.
+				if c, ok := cc.(io.Closer); ok {
+					c.Close()
+				}
 				errc <- err
 				return
 			}
@@ -642,8 +650,14 @@ func (h *Sniffer) sniffingWebsocketFrame(ctx context.Context, rw, cc io.ReadWrit
 		}
 	}()
 
-	<-errc
-	return nil
+	// Wait for both goroutines to finish to prevent fd leaks.
+	var err error
+	for i := 0; i < 2; i++ {
+		if e := <-errc; e != nil && e != io.EOF {
+			err = e
+		}
+	}
+	return err
 }
 
 func (h *Sniffer) copyWebsocketFrame(w io.Writer, r io.Reader, buf *bytes.Buffer, from string, ro *xrecorder.HandlerRecorderObject) (err error) {

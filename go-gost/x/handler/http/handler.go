@@ -694,7 +694,7 @@ func (h *httpHandler) handleUpgradeResponse(ctx context.Context, rw io.ReadWrite
 }
 
 func (h *httpHandler) sniffingWebsocketFrame(ctx context.Context, rw, cc io.ReadWriter, ro *xrecorder.HandlerRecorderObject, log logger.Logger) error {
-	errc := make(chan error, 1)
+	errc := make(chan error, 2) // buffer 2: both goroutines can always send
 
 	sampleRate := h.md.sniffingWebsocketSampleRate
 	if sampleRate == 0 {
@@ -716,6 +716,9 @@ func (h *httpHandler) sniffingWebsocketFrame(ctx context.Context, rw, cc io.Read
 			start := time.Now()
 
 			if err := h.copyWebsocketFrame(cc, rw, buf, "client", ro); err != nil {
+				if c, ok := rw.(io.Closer); ok {
+					c.Close()
+				}
 				errc <- err
 				return
 			}
@@ -742,6 +745,9 @@ func (h *httpHandler) sniffingWebsocketFrame(ctx context.Context, rw, cc io.Read
 			start := time.Now()
 
 			if err := h.copyWebsocketFrame(rw, cc, buf, "server", ro); err != nil {
+				if c, ok := cc.(io.Closer); ok {
+					c.Close()
+				}
 				errc <- err
 				return
 			}
@@ -756,8 +762,13 @@ func (h *httpHandler) sniffingWebsocketFrame(ctx context.Context, rw, cc io.Read
 		}
 	}()
 
-	<-errc
-	return nil
+	var err error
+	for i := 0; i < 2; i++ {
+		if e := <-errc; e != nil && e != io.EOF {
+			err = e
+		}
+	}
+	return err
 }
 
 func (h *httpHandler) copyWebsocketFrame(w io.Writer, r io.Reader, buf *bytes.Buffer, from string, ro *xrecorder.HandlerRecorderObject) (err error) {

@@ -137,6 +137,7 @@ type defaultService struct {
 	handler  handler.Handler
 	status   *Status
 	options  options
+	done     chan struct{} // closed when Serve() exits
 }
 
 func NewService(name string, ln listener.Listener, h handler.Handler, opts ...Option) service.Service {
@@ -149,6 +150,7 @@ func NewService(name string, ln listener.Listener, h handler.Handler, opts ...Op
 		listener: ln,
 		handler:  h,
 		options:  options,
+		done:     make(chan struct{}),
 		status: &Status{
 			createTime: time.Now(),
 			events:     make([]Event, 0, MaxEventSize),
@@ -167,6 +169,7 @@ func (s *defaultService) Addr() net.Addr {
 }
 
 func (s *defaultService) Serve() error {
+	defer close(s.done)
 
 	s.execCmds("post-up", s.options.postUp)
 	s.setState(StateReady)
@@ -316,7 +319,17 @@ func (s *defaultService) Close() error {
 	if closer, ok := s.handler.(io.Closer); ok {
 		closer.Close()
 	}
-	return s.listener.Close()
+	err := s.listener.Close()
+
+	// Wait for the Serve() goroutine to fully exit so the listener socket
+	// and all resources are released before returning. This prevents the
+	// "old port not released" issue when reconfiguring services.
+	select {
+	case <-s.done:
+	case <-time.After(3 * time.Second):
+		s.options.logger.Warnf("service %s: Serve() did not exit within 3s after Close()", s.name)
+	}
+	return err
 }
 
 func (s *defaultService) execCmds(phase string, cmds []string) {

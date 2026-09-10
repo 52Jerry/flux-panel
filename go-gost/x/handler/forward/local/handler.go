@@ -202,6 +202,12 @@ func (h *forwardHandler) Handle(ctx context.Context, conn net.Conn, opts ...hand
 	ro.Network = network
 	ro.Host = addr
 
+	// Loop protection: reject if target points back to this listener.
+	if isForwardingLoop(conn.LocalAddr(), addr) {
+		err = errors.New("forwarding loop detected: target points to listener address")
+		return err
+	}
+
 	var buf bytes.Buffer
 	cc, err := h.options.Router.Dial(ctxvalue.ContextWithBuffer(ctx, &buf), network, addr)
 	ro.Route = buf.String()
@@ -233,4 +239,43 @@ func (h *forwardHandler) checkRateLimit(addr net.Addr) bool {
 	}
 
 	return true
+}
+
+// isForwardingLoop detects when a forward target points back to the listener
+// that accepted the connection, which would create an infinite connection
+// loop (each forwarded connection spawns another to itself) until the host
+// runs out of TCP connections.
+//
+// Matches when:
+//   - target port equals the listener port AND
+//   - target host is loopback (127.0.0.1/::1/localhost) and the listener is
+//     bound to loopback or unspecified (0.0.0.0/::), OR
+//   - target host IP equals the listener IP exactly.
+func isForwardingLoop(localAddr net.Addr, target string) bool {
+	localHost, localPort, err := net.SplitHostPort(localAddr.String())
+	if err != nil {
+		return false
+	}
+	targetHost, targetPort, err := net.SplitHostPort(target)
+	if err != nil {
+		return false
+	}
+	if localPort != targetPort {
+		return false
+	}
+
+	localIP := net.ParseIP(localHost)
+	targetIP := net.ParseIP(targetHost)
+
+	targetIsLoopback := targetHost == "localhost" || (targetIP != nil && targetIP.IsLoopback())
+	localIsOpen := localHost == "localhost" || localIP == nil ||
+		localIP.IsLoopback() || localIP.IsUnspecified()
+
+	if targetIsLoopback && localIsOpen {
+		return true
+	}
+	if localIP != nil && targetIP != nil && localIP.Equal(targetIP) {
+		return true
+	}
+	return false
 }

@@ -81,6 +81,14 @@ func createServices(req createServicesRequest) error {
 	return nil
 }
 
+type serviceUpdate struct {
+	name       string
+	oldService service.Service
+	oldConfig  *config.ServiceConfig
+	newConfig  config.ServiceConfig
+	newService service.Service
+}
+
 func updateServices(req updateServicesRequest) error {
 
 	if len(req.Data) == 0 {
@@ -88,13 +96,6 @@ func updateServices(req updateServicesRequest) error {
 	}
 
 	// 第一阶段：验证所有服务存在，并预先解析所有新配置
-	type serviceUpdate struct {
-		name       string
-		oldService service.Service
-		oldConfig  *config.ServiceConfig
-		newConfig  config.ServiceConfig
-		newService service.Service
-	}
 	var updates []serviceUpdate
 
 	// 建立 name -> 旧配置 的映射

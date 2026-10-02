@@ -17,6 +17,7 @@ import lombok.extern.slf4j.Slf4j;
 
 import javax.annotation.Resource;
 import java.math.BigDecimal;
+import java.util.Collections;
 import java.util.Date;
 import java.util.List;
 import java.util.Objects;
@@ -146,16 +147,34 @@ public class FlowController extends BaseController {
         // 2. 尝试解密数据
         String decryptedData = decryptIfNeeded(rawData, secret);
 
-        // 3. 解析为FlowDto列表
-        FlowDto flowDataList = JSONObject.parseObject(decryptedData, FlowDto.class);
-        if (Objects.equals(flowDataList.getN(), "web_api")) {
+        // 3. 兼容单对象与数组两种节点上报格式
+        List<FlowDto> flowDataList = parseFlowPayload(decryptedData);
+        if (flowDataList.isEmpty()) {
             return SUCCESS_RESPONSE;
         }
 
-        // 记录日志
-        log.info("节点上报流量数据{}", flowDataList);
-        // 4. 处理流量数据
-        return processFlowData(flowDataList);
+        for (FlowDto flowData : flowDataList) {
+            if (Objects.equals(flowData.getN(), "web_api")) {
+                continue;
+            }
+            log.info("节点上报流量数据{}", flowData);
+            processFlowData(flowData);
+        }
+
+        return SUCCESS_RESPONSE;
+    }
+
+    static List<FlowDto> parseFlowPayload(String rawData) {
+        String data = rawData == null ? "" : rawData.trim();
+        if (data.isEmpty()) {
+            return Collections.emptyList();
+        }
+        if (data.startsWith("{")) {
+            FlowDto flowData = JSONObject.parseObject(data, FlowDto.class);
+            return flowData == null ? Collections.emptyList() : Collections.singletonList(flowData);
+        }
+        List<FlowDto> flowDataList = JSONObject.parseArray(data, FlowDto.class);
+        return flowDataList == null ? Collections.emptyList() : flowDataList;
     }
 
     /**

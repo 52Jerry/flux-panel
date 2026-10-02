@@ -24,6 +24,8 @@ import org.springframework.context.annotation.Lazy;
 import org.springframework.stereotype.Service;
 
 import javax.annotation.Resource;
+import java.time.LocalDateTime;
+import java.time.ZoneId;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
@@ -727,10 +729,20 @@ public class UserServiceImpl extends ServiceImpl<UserMapper, User> implements Us
      * @return 最近24小时流量统计列表
      */
     private List<StatisticsFlow> getLast24HoursFlowStatistics(Long userId) {
-        // 按ID倒序查最近24条记录（ID越大越新，时间就是23:00, 22:00, 21:00...这样倒序）
+        long startOfWindow = LocalDateTime.now()
+                .withMinute(0)
+                .withSecond(0)
+                .withNano(0)
+                .minusHours(23)
+                .atZone(ZoneId.systemDefault())
+                .toInstant()
+                .toEpochMilli();
+
+        // 按ID倒序查询当前24小时窗口内的记录
         List<StatisticsFlow> recentFlows = statisticsFlowService.list(
                 new QueryWrapper<StatisticsFlow>()
                         .eq("user_id", userId)
+                        .ge("created_time", startOfWindow)
                         .orderByDesc("id")
                         .last("LIMIT 24")
         );

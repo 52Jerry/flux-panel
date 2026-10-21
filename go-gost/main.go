@@ -38,6 +38,8 @@ var (
 	trace        bool
 	apiAddr      string
 	metricsAddr  string
+	standalone   bool
+	printVersion bool
 )
 
 func init() {
@@ -85,8 +87,6 @@ func worker(id int, args []string, ctx *context.Context, ret *int) {
 }
 
 func init() {
-	var printVersion bool
-
 	flag.Var(&services, "L", "service list")
 	flag.Var(&nodes, "F", "chain node list")
 	flag.StringVar(&cfgFile, "C", "", "configuration file")
@@ -96,32 +96,34 @@ func init() {
 	flag.BoolVar(&trace, "DD", false, "trace mode")
 	flag.StringVar(&apiAddr, "api", "", "api service address")
 	flag.StringVar(&metricsAddr, "metrics", "", "metrics service address")
-	flag.Parse()
-
-	if printVersion {
-		fmt.Fprintf(os.Stdout, "gost %s (%s %s/%s)\n",
-			version, runtime.Version(), runtime.GOOS, runtime.GOARCH)
-		os.Exit(0)
-	}
+	flag.BoolVar(&standalone, "standalone", false, "run local configuration without a panel connection")
 }
 
 func main() {
-	// 加载配置文件
-	config, err := LoadConfig("config.json")
-	if err != nil {
-		fmt.Printf("❌ 配置加载失败: %v\n", err)
-		fmt.Println("请确保当前目录存在 config.json 文件")
-		os.Exit(1)
+	flag.Parse()
+	if printVersion {
+		fmt.Fprintf(os.Stdout, "gost %s (%s %s/%s) features=wireguard\n",
+			version, runtime.Version(), runtime.GOOS, runtime.GOARCH)
+		os.Exit(0)
 	}
-
-	fmt.Printf("✅ 配置加载成功 - addr: %s\n", config.Addr)
-
 	log := xlogger.NewLogger()
 	logger.SetDefault(log)
+	if !standalone {
+		// 加载配置文件
+		config, err := LoadConfig("config.json")
+		if err != nil {
+			fmt.Printf("❌ 配置加载失败: %v\n", err)
+			fmt.Println("请确保当前目录存在 config.json 文件")
+			os.Exit(1)
+		}
 
-	wsReporter := socket.StartWebSocketReporterWithConfig(config.Addr, config.Secret, config.Http, config.Tls, config.Socks, "1.2.4")
-	defer wsReporter.Stop()
-	service.SetHTTPReportURL(config.Addr, config.Secret)
+		fmt.Printf("✅ 配置加载成功 - addr: %s\n", config.Addr)
+		service.SetProtocolBlock(config.Http, config.Tls, config.Socks)
+
+		wsReporter := socket.StartWebSocketReporterWithConfig(config.Addr, config.Secret, config.Http, config.Tls, config.Socks, "1.2.4")
+		defer wsReporter.Stop()
+		service.SetHTTPReportURL(config.Addr, config.Secret)
+	}
 
 	p := &program{}
 	if err := svc.Run(p); err != nil {

@@ -41,6 +41,10 @@ func ParseNode(hop string, cfg *config.NodeConfig, log logger.Logger) (*chain.No
 			Type: "tcp",
 		}
 	}
+	isWG := func(s string) bool { return s == "wg" || s == "wireguard" }
+	if isWG(cfg.Dialer.Type) != isWG(cfg.Connector.Type) {
+		return nil, fmt.Errorf("wg: use both the wg dialer and wg connector")
+	}
 
 	nodeLogger := log.WithFields(map[string]any{
 		"hop":       hop,
@@ -219,7 +223,7 @@ func ParseNode(hop string, cfg *config.NodeConfig, log logger.Logger) (*chain.No
 		rewriteURL := cfg.HTTP.RewriteURL
 		if rewriteURL == nil {
 			rewriteURL = cfg.HTTP.Rewrite
-		} 
+		}
 		for _, v := range rewriteURL {
 			if pattern, _ := regexp.Compile(v.Match); pattern != nil {
 				settings.RewriteURL = append(settings.RewriteURL, chain.HTTPURLRewriteSetting{

@@ -23,14 +23,44 @@ build_download_url() {
 }
 
 # 下载地址
-DOWNLOAD_URL=$(build_download_url)
+DOWNLOAD_URL="${GOST_DOWNLOAD_URL:-$(build_download_url)}"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# A locally built fork must take precedence over the upstream release.
+LOCAL_BINARY="${GOST_BINARY:-}"
+if [[ -z "$LOCAL_BINARY" && -f "$SCRIPT_DIR/go-gost/dist/gost-$(get_architecture)" ]]; then
+    LOCAL_BINARY="$SCRIPT_DIR/go-gost/dist/gost-$(get_architecture)"
+fi
 INSTALL_DIR="/etc/gost"
-COUNTRY=$(curl -s https://ipinfo.io/country)
+COUNTRY=""
+if [[ -z "$LOCAL_BINARY" && -z "${GOST_DOWNLOAD_URL:-}" ]]; then
+    COUNTRY=$(curl -s --max-time 5 https://ipinfo.io/country)
+fi
 if [ "$COUNTRY" = "CN" ]; then
     # 拼接 URL
     DOWNLOAD_URL="https://ghfast.top/${DOWNLOAD_URL}"
 fi
 
+prepare_gost_binary() {
+    local target="$1"
+    if [[ -n "$LOCAL_BINARY" ]]; then
+        echo "📦 使用本地构建: $LOCAL_BINARY"
+        cp -- "$LOCAL_BINARY" "$target" || return 1
+    else
+        echo "⬇️ 下载: $DOWNLOAD_URL"
+        curl --fail --location --retry 2 "$DOWNLOAD_URL" -o "$target" || return 1
+    fi
+    [[ -s "$target" ]] || return 1
+    chmod +x "$target" || return 1
+    if [[ "${GOST_REQUIRE_WIREGUARD:-0}" == "1" ]]; then
+        local version
+        version=$("$target" -V) || return 1
+        echo "$version"
+        if [[ "$version" != *"features=wireguard"* ]]; then
+            echo "❌ 该二进制未声明 WireGuard 支持，请使用本仓库构建的版本。"
+            return 1
+        fi
+    fi
+}
 
 
 # 显示菜单
@@ -48,6 +78,8 @@ show_menu() {
 
 # 删除脚本自身
 delete_self() {
+  # Keep tracked source when running the installer from a checkout.
+  [[ -e "$SCRIPT_DIR/.git" ]] && return 0
   echo ""
   echo "🗑️ 操作已完成，正在清理脚本文件..."
   SCRIPT_PATH="$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || echo "$0")"
@@ -164,6 +196,12 @@ install_gost() {
 
   mkdir -p "$INSTALL_DIR"
 
+  # Validate the replacement before stopping or replacing a working service.
+  if ! prepare_gost_binary "$INSTALL_DIR/gost.new"; then
+    echo "❌ 无法准备有效的 GOST 二进制。"
+    return 1
+  fi
+
   # 停止并禁用已有服务
   if systemctl list-units --full -all | grep -Fq "gost.service"; then
     echo "🔍 检测到已存在的gost服务"
@@ -171,17 +209,7 @@ install_gost() {
     systemctl disable gost 2>/dev/null && echo "🚫 禁用自启"
   fi
 
-  # 删除旧文件
-  [[ -f "$INSTALL_DIR/gost" ]] && echo "🧹 删除旧文件 gost" && rm -f "$INSTALL_DIR/gost"
-
-  # 下载 gost
-  echo "⬇️ 下载 gost 中..."
-  curl -L "$DOWNLOAD_URL" -o "$INSTALL_DIR/gost"
-  if [[ ! -f "$INSTALL_DIR/gost" || ! -s "$INSTALL_DIR/gost" ]]; then
-    echo "❌ 下载失败，请检查网络或下载链接。"
-    exit 1
-  fi
-  chmod +x "$INSTALL_DIR/gost"
+  mv -- "$INSTALL_DIR/gost.new" "$INSTALL_DIR/gost" || return 1
   echo "✅ 下载完成"
 
   # 打印版本
@@ -260,9 +288,8 @@ update_gost() {
   
   # 先下载新版本
   echo "⬇️ 下载最新版本..."
-  curl -L "$DOWNLOAD_URL" -o "$INSTALL_DIR/gost.new"
-  if [[ ! -f "$INSTALL_DIR/gost.new" || ! -s "$INSTALL_DIR/gost.new" ]]; then
-    echo "❌ 下载失败。"
+  if ! prepare_gost_binary "$INSTALL_DIR/gost.new"; then
+    echo "❌ 无法准备有效的 GOST 二进制。"
     return 1
   fi
 
@@ -325,7 +352,7 @@ uninstall_gost() {
 main() {
   # 如果提供了命令行参数，直接执行安装
   if [[ -n "$SERVER_ADDR" && -n "$SECRET" ]]; then
-    install_gost
+    install_gost || exit 1
     delete_self
     exit 0
   fi
@@ -337,12 +364,12 @@ main() {
     
     case $choice in
       1)
-        install_gost
+        install_gost || exit 1
         delete_self
         exit 0
         ;;
       2)
-        update_gost
+        update_gost || exit 1
         delete_self
         exit 0
         ;;
@@ -369,5 +396,7 @@ main() {
   done
 }
 
-# 执行主函数
-main
+# Only run the menu when executed, so validation helpers can be tested safely.
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main
+fi

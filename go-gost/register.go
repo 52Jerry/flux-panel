@@ -18,6 +18,7 @@ import (
 	_ "github.com/go-gost/x/connector/tcp"
 	_ "github.com/go-gost/x/connector/tunnel"
 	_ "github.com/go-gost/x/connector/unix"
+	_ "github.com/go-gost/x/connector/wg"
 
 	// Register dialers
 	_ "github.com/go-gost/x/dialer/direct"
@@ -44,6 +45,7 @@ import (
 	_ "github.com/go-gost/x/dialer/tls"
 	_ "github.com/go-gost/x/dialer/udp"
 	_ "github.com/go-gost/x/dialer/unix"
+	_ "github.com/go-gost/x/dialer/wg"
 	_ "github.com/go-gost/x/dialer/ws"
 
 	// Register handlers

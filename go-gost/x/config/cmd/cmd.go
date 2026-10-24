@@ -521,6 +521,17 @@ func buildNodeConfig(url *url.URL) (*config.NodeConfig, error) {
 		connector = schemes[0]
 		dialer = schemes[1]
 	}
+	// WireGuard must never silently fall back to HTTP/TCP in a build where
+	// the corresponding registration imports are missing.
+	if connector == "wg" || connector == "wireguard" || dialer == "wg" || dialer == "wireguard" {
+		isWG := func(s string) bool { return s == "wg" || s == "wireguard" }
+		if !isWG(connector) || !isWG(dialer) {
+			return nil, fmt.Errorf("wg: use both the wg dialer and wg connector")
+		}
+		if registry.ConnectorRegistry().Get(connector) == nil || registry.DialerRegistry().Get(dialer) == nil {
+			return nil, fmt.Errorf("wg: WireGuard support is not registered in this binary")
+		}
+	}
 
 	m := map[string]any{}
 	for k, v := range url.Query() {

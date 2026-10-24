@@ -74,14 +74,16 @@ func (p *program) Start() error {
 	p.cancel = cancel
 	go p.reload(ctx)
 
-	go func() {
-		select {
-		case <-time.After(10 * time.Second):
-			xservice.StartConfigReporter(ctx)
-		case <-ctx.Done():
-			return
-		}
-	}()
+	if !standalone {
+		go func() {
+			select {
+			case <-time.After(10 * time.Second):
+				xservice.StartConfigReporter(ctx)
+			case <-ctx.Done():
+				return
+			}
+		}()
+	}
 
 	return nil
 }

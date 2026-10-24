@@ -1,0 +1,4 @@
+# Keep scripts runnable when copied from a Windows checkout to Linux.
+install.sh text eol=lf
+go-gost/build-linux.sh text eol=lf
+go-gost/verify-linux.sh text eol=lf

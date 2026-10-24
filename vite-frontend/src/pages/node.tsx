@@ -9,8 +9,11 @@ import { Switch } from "@heroui/switch";
 import { Spinner } from "@heroui/spinner";
 import { Alert } from "@heroui/alert";
 import { Progress } from "@heroui/progress";
+import { Radio, RadioGroup } from '@heroui/radio';
 import toast from 'react-hot-toast';
 import axios from 'axios';
+import { emptyNodeForm, isModernNode, nodeToForm, nodePayload, nodePortLabel, validPorts } from '@/utils/node-config';
+import type { NodeConfig, NodeForm } from '@/utils/node-config';
 
 
 import { 
@@ -21,17 +24,8 @@ import {
   getNodeInstallCommand
 } from "@/api";
 
-interface Node {
-  id: number;
-  name: string;
-  ip: string;
-  serverIp: string;
-  portSta: number;
-  portEnd: number;
+interface Node extends NodeConfig {
   version?: string;
-  http?: number; // 0 关 1 开
-  tls?: number;  // 0 关 1 开
-  socks?: number; // 0 关 1 开
   status: number; // 1: 在线, 0: 离线
   connectionStatus: 'online' | 'offline';
   systemInfo?: {
@@ -46,18 +40,6 @@ interface Node {
   copyLoading?: boolean;
 }
 
-interface NodeForm {
-  id: number | null;
-  name: string;
-  ipString: string;
-  serverIp: string;
-  portSta: number;
-  portEnd: number;
-  http: number; // 0 关 1 开
-  tls: number;  // 0 关 1 开
-  socks: number; // 0 关 1 开
-}
-
 export default function NodePage() {
   const [nodeList, setNodeList] = useState<Node[]>([]);
   const [loading, setLoading] = useState(false);
@@ -70,17 +52,7 @@ export default function NodePage() {
   const [nodeToDelete, setNodeToDelete] = useState<Node | null>(null);
   const [protocolDisabled, setProtocolDisabled] = useState(false);
   const [protocolDisabledReason, setProtocolDisabledReason] = useState('');
-  const [form, setForm] = useState<NodeForm>({
-    id: null,
-    name: '',
-    ipString: '',
-    serverIp: '',
-    portSta: 1000,
-    portEnd: 65535,
-    http: 0,
-    tls: 0,
-    socks: 0
-  });
+  const [form, setForm] = useState<NodeForm>(() => emptyNodeForm());
   const [errors, setErrors] = useState<Record<string, string>>({});
   
   // 安装命令相关状态
@@ -91,13 +63,23 @@ export default function NodePage() {
   const websocketRef = useRef<WebSocket | null>(null);
   const reconnectTimerRef = useRef<NodeJS.Timeout | null>(null);
   const reconnectAttemptsRef = useRef(0);
-  const maxReconnectAttempts = 5;
+  const reconnectBaseDelay = 3000;
+  const reconnectMaxDelay = 30000;
 
   useEffect(() => {
     loadNodes();
     initWebSocket();
+
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'visible') {
+        initWebSocket();
+      }
+    };
+
+    document.addEventListener('visibilitychange', handleVisibilityChange);
     
     return () => {
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
       closeWebSocket();
     };
   }, []);
@@ -162,6 +144,11 @@ export default function NodePage() {
       
       websocketRef.current.onclose = () => {
         websocketRef.current = null;
+        setNodeList(prev => prev.map(node => ({
+          ...node,
+          connectionStatus: 'offline',
+          systemInfo: null
+        })));
         attemptReconnect();
       };
     } catch (error) {
@@ -249,13 +236,20 @@ export default function NodePage() {
 
   // 尝试重新连接
   const attemptReconnect = () => {
-    if (reconnectAttemptsRef.current < maxReconnectAttempts) {
-      reconnectAttemptsRef.current++;
-      
-      reconnectTimerRef.current = setTimeout(() => {
-        initWebSocket();
-      }, 3000 * reconnectAttemptsRef.current);
+    if (reconnectTimerRef.current) {
+      return;
     }
+
+    const delay = Math.min(
+      reconnectBaseDelay * Math.pow(2, reconnectAttemptsRef.current),
+      reconnectMaxDelay
+    );
+    reconnectAttemptsRef.current++;
+
+    reconnectTimerRef.current = setTimeout(() => {
+      reconnectTimerRef.current = null;
+      initWebSocket();
+    }, delay);
   };
 
   // 关闭WebSocket连接
@@ -374,9 +368,9 @@ export default function NodePage() {
       newErrors.name = '节点名称长度不能超过50位';
     }
     
-    if (!form.ipString.trim()) {
+    if (form.schema === 'legacy' && !form.ipString.trim()) {
       newErrors.ipString = '请输入入口IP地址';
-    } else {
+    } else if (form.schema === 'legacy') {
       const ips = form.ipString.split('\n').map(ip => ip.trim()).filter(ip => ip);
       if (ips.length === 0) {
         newErrors.ipString = '请输入至少一个有效IP地址';
@@ -396,14 +390,28 @@ export default function NodePage() {
       newErrors.serverIp = '请输入有效的IPv4、IPv6地址或域名';
     }
     
-    if (!form.portSta || form.portSta < 1 || form.portSta > 65535) {
-      newErrors.portSta = '端口范围必须在1-65535之间';
-    }
-    
-    if (!form.portEnd || form.portEnd < 1 || form.portEnd > 65535) {
-      newErrors.portEnd = '端口范围必须在1-65535之间';
-    } else if (form.portEnd < form.portSta) {
-      newErrors.portEnd = '结束端口不能小于起始端口';
+    if (form.schema === 'modern') {
+      if (!validPorts(form.port)) {
+        newErrors.port = '请输入1-65535内的端口或端口段，用英文逗号分隔';
+      }
+      for (const field of ['tcpListenAddr', 'udpListenAddr'] as const) {
+        const address = form[field].trim();
+        const unwrapped = address.startsWith('[') && address.endsWith(']')
+          ? address.slice(1, -1) : address;
+        if (!address || !validateIp(unwrapped)) {
+          newErrors[field] = '请输入有效的监听地址';
+        }
+      }
+    } else {
+      if (!Number.isInteger(form.portSta) || form.portSta < 1 || form.portSta > 65535) {
+        newErrors.portSta = '端口范围必须在1-65535之间';
+      }
+
+      if (!Number.isInteger(form.portEnd) || form.portEnd < 1 || form.portEnd > 65535) {
+        newErrors.portEnd = '端口范围必须在1-65535之间';
+      } else if (form.portEnd < form.portSta) {
+        newErrors.portEnd = '结束端口不能小于起始端口';
+      }
     }
     
     setErrors(newErrors);
@@ -424,17 +432,8 @@ export default function NodePage() {
   const handleEdit = (node: Node) => {
     setDialogTitle('编辑节点');
     setIsEdit(true);
-    setForm({
-      id: node.id,
-      name: node.name,
-      ipString: node.ip ? node.ip.split(',').map(ip => ip.trim()).join('\n') : '',
-      serverIp: node.serverIp || '',
-      portSta: node.portSta,
-      portEnd: node.portEnd,
-      http: typeof node.http === 'number' ? node.http : 1,
-      tls: typeof node.tls === 'number' ? node.tls : 1,
-      socks: typeof node.socks === 'number' ? node.socks : 1
-    });
+    setForm(nodeToForm(node));
+    setErrors({});
     const offline = node.connectionStatus !== 'online';
     setProtocolDisabled(offline);
     setProtocolDisabledReason(offline ? '节点未在线，等待节点上线后再设置' : '');
@@ -483,7 +482,7 @@ export default function NodePage() {
         } catch (copyError) {
           // 复制失败，显示安装命令模态框
           setInstallCommand(res.data);
-          setCurrentNodeName(node.name);
+          setCurrentNodeName(node.name ?? '');
           setInstallCommandModal(true);
         }
       } else {
@@ -516,29 +515,8 @@ export default function NodePage() {
     setSubmitLoading(true);
     
     try {
-      const ipString = form.ipString
-        .split('\n')
-        .map(ip => ip.trim())
-        .filter(ip => ip)
-        .join(',');
-        
-      const submitData = {
-        ...form,
-        ip: ipString
-      };
-      delete (submitData as any).ipString;
-      
       const apiCall = isEdit ? updateNode : createNode;
-      const data = isEdit ? submitData : { 
-        name: form.name, 
-        ip: ipString,
-        serverIp: form.serverIp,
-        portSta: form.portSta,
-        portEnd: form.portEnd,
-        http: form.http,
-        tls: form.tls,
-        socks: form.socks
-      };
+      const data = nodePayload(form);
       
       const res = await apiCall(data);
       if (res.code === 0) {
@@ -549,14 +527,7 @@ export default function NodePage() {
           setNodeList(prev => prev.map(n => 
             n.id === form.id ? {
               ...n,
-              name: form.name,
-              ip: ipString,
-              serverIp: form.serverIp,
-              portSta: form.portSta,
-              portEnd: form.portEnd,
-              http: form.http,
-              tls: form.tls,
-              socks: form.socks
+              ...data
             } : n
           ));
         } else {
@@ -574,17 +545,7 @@ export default function NodePage() {
 
   // 重置表单
   const resetForm = () => {
-    setForm({
-      id: null,
-      name: '',
-      ipString: '',
-      serverIp: '',
-      portSta: 1000,
-      portEnd: 65535,
-      http: 0,
-      tls: 0,
-      socks: 0
-    });
+    setForm(emptyNodeForm(nodeList.some(isModernNode) ? 'modern' : 'legacy'));
     setErrors({});
   };
 
@@ -662,9 +623,15 @@ export default function NodePage() {
                   {/* 基础信息 */}
                   <div className="space-y-2 mb-4">
                     <div className="flex justify-between items-center text-sm min-w-0">
-                      <span className="text-default-600 flex-shrink-0">入口IP</span>
+                      <span className="text-default-600 flex-shrink-0">{isModernNode(node) ? '监听地址' : '入口IP'}</span>
                       <div className="text-right text-xs min-w-0 flex-1 ml-2">
-                        {node.ip ? (
+                        {isModernNode(node) ? (
+                          <span className="font-mono break-all" title={`TCP: ${node.tcpListenAddr ?? '-'} / UDP: ${node.udpListenAddr ?? '-'}`}>
+                            {node.tcpListenAddr === node.udpListenAddr
+                              ? node.tcpListenAddr || '-'
+                              : `TCP ${node.tcpListenAddr || '-'} / UDP ${node.udpListenAddr || '-'}`}
+                          </span>
+                        ) : node.ip ? (
                           node.ip.split(',').length > 1 ? (
                             <span className="font-mono truncate block" title={node.ip.split(',')[0].trim()}>
                               {node.ip.split(',')[0].trim()} +{node.ip.split(',').length - 1}个
@@ -679,7 +646,7 @@ export default function NodePage() {
                     </div>
                     <div className="flex justify-between text-sm">
                       <span className="text-default-600">端口</span>
-                      <span className="text-xs">{node.portSta}-{node.portEnd}</span>
+                      <span className="text-xs text-right break-all min-w-0 ml-2">{nodePortLabel(node)}</span>
                     </div>
                     <div className="flex justify-between text-sm">
                       <span className="text-default-600">版本</span>
@@ -837,6 +804,20 @@ export default function NodePage() {
             <ModalHeader>{dialogTitle}</ModalHeader>
             <ModalBody>
               <div className="space-y-4">
+                {!isEdit && nodeList.length === 0 && (
+                  <RadioGroup
+                    label="节点配置格式"
+                    orientation="horizontal"
+                    value={form.schema}
+                    onValueChange={(value) => {
+                      setForm(prev => ({ ...prev, schema: value as NodeForm['schema'] }));
+                      setErrors({});
+                    }}
+                  >
+                    <Radio value="modern">端口列表</Radio>
+                    <Radio value="legacy">起止端口</Radio>
+                  </RadioGroup>
+                )}
                 <Input
                   label="节点名称"
                   placeholder="请输入节点名称"
@@ -857,7 +838,7 @@ export default function NodePage() {
                   variant="bordered"
                 />
 
-                <Textarea
+                {form.schema === 'legacy' && <Textarea
                   label="入口IP"
                   placeholder="一行一个IP地址或域名，例如:&#10;192.168.1.100&#10;example.com"
                   value={form.ipString}
@@ -868,9 +849,37 @@ export default function NodePage() {
                   minRows={3}
                   maxRows={5}
                   description="支持多个IP，每行一个地址"
-                />
+                />}
 
-                <div className="grid grid-cols-2 gap-4">
+                {form.schema === 'modern' ? (
+                  <>
+                    <Input
+                      label="端口" placeholder="5001-6000,61001"
+                      value={form.port} variant="bordered"
+                      onValueChange={(port) => setForm(prev => ({ ...prev, port }))}
+                      isInvalid={!!errors.port} errorMessage={errors.port}
+                    />
+                    <Input
+                      label="网卡" placeholder="ens19"
+                      value={form.interfaceName} variant="bordered"
+                      onValueChange={(interfaceName) => setForm(prev => ({ ...prev, interfaceName }))}
+                    />
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                      <Input
+                        label="TCP监听地址" placeholder="[::]"
+                        value={form.tcpListenAddr} variant="bordered"
+                        onValueChange={(tcpListenAddr) => setForm(prev => ({ ...prev, tcpListenAddr }))}
+                        isInvalid={!!errors.tcpListenAddr} errorMessage={errors.tcpListenAddr}
+                      />
+                      <Input
+                        label="UDP监听地址" placeholder="[::]"
+                        value={form.udpListenAddr} variant="bordered"
+                        onValueChange={(udpListenAddr) => setForm(prev => ({ ...prev, udpListenAddr }))}
+                        isInvalid={!!errors.udpListenAddr} errorMessage={errors.udpListenAddr}
+                      />
+                    </div>
+                  </>
+                ) : <div className="grid grid-cols-2 gap-4">
                   <Input
                     label="起始端口"
                     type="number"
@@ -896,7 +905,7 @@ export default function NodePage() {
                     min={1}
                     max={65535}
                   />
-                </div>
+                </div>}
 
                 {/* 屏蔽协议 */}
                 <div className="mt-1">
@@ -920,11 +929,14 @@ export default function NodePage() {
                       <div className="flex items-center justify-between">
                         <div className="text-xs text-default-500">禁用/启用</div>
                         <Switch
+                          aria-label="屏蔽HTTP"
                           size="sm"
                           isSelected={form.http === 1}
                           isDisabled={protocolDisabled}
                           onValueChange={(v) => setForm(prev => ({ ...prev, http: v ? 1 : 0 }))}
-                        />
+                        >
+                          <span className="sr-only">屏蔽HTTP</span>
+                        </Switch>
                       </div>
                       <div className="mt-1 text-xs text-default-400">{form.http === 1 ? '已开启' : '已关闭'}</div>
                     </div>
@@ -938,11 +950,14 @@ export default function NodePage() {
                       <div className="flex items-center justify-between">
                         <div className="text-xs text-default-500">禁用/启用</div>
                         <Switch
+                          aria-label="屏蔽TLS"
                           size="sm"
                           isSelected={form.tls === 1}
                           isDisabled={protocolDisabled}
                           onValueChange={(v) => setForm(prev => ({ ...prev, tls: v ? 1 : 0 }))}
-                        />
+                        >
+                          <span className="sr-only">屏蔽TLS</span>
+                        </Switch>
                       </div>
                       <div className="mt-1 text-xs text-default-400">{form.tls === 1 ? '已开启' : '已关闭'}</div>
                     </div>
@@ -956,11 +971,14 @@ export default function NodePage() {
                       <div className="flex items-center justify-between">
                         <div className="text-xs text-default-500">禁用/启用</div>
                         <Switch
+                          aria-label="屏蔽SOCKS"
                           size="sm"
                           isSelected={form.socks === 1}
                           isDisabled={protocolDisabled}
                           onValueChange={(v) => setForm(prev => ({ ...prev, socks: v ? 1 : 0 }))}
-                        />
+                        >
+                          <span className="sr-only">屏蔽SOCKS</span>
+                        </Switch>
                       </div>
                       <div className="mt-1 text-xs text-default-400">{form.socks === 1 ? '已开启' : '已关闭'}</div>
                     </div>
@@ -979,7 +997,9 @@ export default function NodePage() {
                 <Alert
                         color="primary"
                         variant="flat"
-                        description="服务器ip是你要添加的服务器的ip地址，不是面板的ip地址。入口ip是用于展示在转发页面，面向用户的访问地址。实在理解不到说明你没这个需求，都填节点的服务器ip就行！"
+                        description={form.schema === 'modern'
+                          ? '修改端口或监听地址可能影响现有转发连接，请确认配置后保存。'
+                          : '修改入口地址或端口可能影响现有转发连接，请确认配置后保存。'}
                         className="mt-4"
                       />
               </div>
@@ -1094,4 +1114,4 @@ export default function NodePage() {
       </div>
     
   );
-} 
+}

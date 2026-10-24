@@ -2,6 +2,7 @@ package net
 
 import (
 	"io"
+	"sync"
 	"time"
 
 	"github.com/go-gost/core/common/bufpool"
@@ -18,21 +19,27 @@ const (
 // becomes unresponsive (e.g. dead residential SOCKS proxy).
 func Transport(rw1, rw2 io.ReadWriter) error {
 	errc := make(chan error, 2) // buffer 2: both goroutines can always send
+	var once sync.Once
+	closeBoth := func() {
+		once.Do(func() {
+			if c, ok := rw1.(io.Closer); ok {
+				c.Close()
+			}
+			if c, ok := rw2.(io.Closer); ok {
+				c.Close()
+			}
+		})
+	}
 
 	go func() {
 		err := CopyBuffer(rw1, rw2, bufferSize)
-		// Close the other side to interrupt the second goroutine immediately.
-		if c, ok := rw2.(io.Closer); ok {
-			c.Close()
-		}
+		closeBoth()
 		errc <- err
 	}()
 
 	go func() {
 		err := CopyBuffer(rw2, rw1, bufferSize)
-		if c, ok := rw1.(io.Closer); ok {
-			c.Close()
-		}
+		closeBoth()
 		errc <- err
 	}()
 
@@ -48,7 +55,7 @@ func Transport(rw1, rw2 io.ReadWriter) error {
 // TransportWithIdleTimeout is like Transport but applies a per-read idle
 // deadline. If no data arrives on either connection within idleTimeout
 // seconds, the blocked Read() returns a deadline-exceeded error which
-// triggers the half-close logic in Transport.
+// triggers connection cleanup in Transport.
 func TransportWithIdleTimeout(rw1, rw2 io.ReadWriter, idleTimeout int) error {
 	if idleTimeout <= 0 {
 		return Transport(rw1, rw2)
@@ -66,7 +73,7 @@ func TransportWithIdleTimeout(rw1, rw2 io.ReadWriter, idleTimeout int) error {
 // (net.Conn does), the deadline is enforced by the OS, causing the Read
 // to return after the timeout even if the peer sends nothing.
 type idleDeadlineConn struct {
-	rw     io.ReadWriter
+	rw      io.ReadWriter
 	timeout time.Duration
 }
 

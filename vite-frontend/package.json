@@ -4,6 +4,8 @@
   "version": "0.0.0",
   "type": "module",
   "scripts": {
+    "test:node-config": "node --test tests/node-config.test.mjs",
+    "test:node-page": "node tests/node-page.browser.mjs",
     "dev": "vite",
     "build": "tsc && vite build",
     "lint": "eslint --fix",

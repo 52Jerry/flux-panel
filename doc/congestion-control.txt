@@ -36,6 +36,10 @@ Flux的forwardId_userId_userTunnelId_protocol名称先验证数字ID和tcp/udp/t
 非Flux名称回退完整service名；none使用单一共享FIFO组；外部HTTP/gRPC限速插件保持其提供方语义。
 每个方向最多4096个待授权请求、1024个活跃组，每公平组128个请求；满队列返回明确错误。
 取消/Close摘除请求，空组删除，空闲runner在50ms后退出。缓存每方向最多4096条。
+面板UpdateLimiters对无外部loader的内置限速器做纯速率调整时，保留现有桶及等待中的连接。
+该路径要求规则key集合、各方向启用状态及metadata等策略不变；原地调整不会补满突发额度。
+新增/删除规则、启用/禁用方向、变更策略或loader/plugin使用替换路径，旧策略下的等待可能中断。
+替换先发布新限速器再关闭旧对象，避免短暂移除注册项造成无限速空窗。
 
 链路观测
 

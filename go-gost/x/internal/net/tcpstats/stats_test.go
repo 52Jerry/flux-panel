@@ -94,3 +94,25 @@ func TestTrackReleaseIsIdempotentAndDoesNotTreatPipesAsKernelTCP(t *testing.T) {
 		t.Fatal("release changed unrelated observations")
 	}
 }
+
+type closingAddrConn struct {
+	testConn
+	lookups int
+}
+
+func (c *closingAddrConn) LocalAddr() net.Addr {
+	c.lookups++
+	if c.lookups > 1 {
+		return nil
+	}
+	return &net.TCPAddr{Port: 1234}
+}
+
+func TestTrackCapturesAddressOnceWhenConnectionCanClose(t *testing.T) {
+	conn := &closingAddrConn{}
+	release := Track(conn, nil)
+	defer release()
+	if conn.lookups != 1 {
+		t.Fatalf("LocalAddr called %d times during registration", conn.lookups)
+	}
+}

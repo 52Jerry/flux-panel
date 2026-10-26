@@ -2,13 +2,21 @@ package socket
 
 import (
 	"errors"
+	"io"
+	"reflect"
+	"strings"
+	"sync"
+
 	"github.com/go-gost/x/config"
 	parser "github.com/go-gost/x/config/parsing/limiter"
 	"github.com/go-gost/x/registry"
-	"strings"
 )
 
+var limiterConfigMu sync.Mutex
+
 func createLimiter(req createLimiterRequest) error {
+	limiterConfigMu.Lock()
+	defer limiterConfigMu.Unlock()
 	name := strings.TrimSpace(req.Data.Name)
 	if name == "" {
 		return errors.New("limiter name is required")
@@ -22,6 +30,9 @@ func createLimiter(req createLimiterRequest) error {
 	v := parser.ParseTrafficLimiter(&req.Data)
 
 	if err := registry.TrafficLimiterRegistry().Register(name, v); err != nil {
+		if closer, ok := v.(io.Closer); ok {
+			closer.Close()
+		}
 		return errors.New("limiter " + name + " already exists")
 	}
 
@@ -34,6 +45,8 @@ func createLimiter(req createLimiterRequest) error {
 }
 
 func updateLimiter(req updateLimiterRequest) error {
+	limiterConfigMu.Lock()
+	defer limiterConfigMu.Unlock()
 
 	name := strings.TrimSpace(req.Limiter)
 
@@ -43,12 +56,37 @@ func updateLimiter(req updateLimiterRequest) error {
 
 	req.Data.Name = name
 
-	v := parser.ParseTrafficLimiter(&req.Data)
-
-	registry.TrafficLimiterRegistry().Unregister(name)
-
-	if err := registry.TrafficLimiterRegistry().Register(name, v); err != nil {
-		return errors.New("limiter " + name + " already exists")
+	var oldConfig *config.LimiterConfig
+	config.OnUpdate(func(c *config.Config) error {
+		for _, item := range c.Limiters {
+			if item != nil && item.Name == name {
+				copy := *item
+				oldConfig = &copy
+				break
+			}
+		}
+		return nil
+	})
+	updated := false
+	if sameLimiterPolicy(oldConfig, &req.Data) {
+		if updater, ok := registry.TrafficLimiterRegistry().Get(name).(interface {
+			TryUpdateLimits([]string) (bool, error)
+		}); ok {
+			var err error
+			updated, err = updater.TryUpdateLimits(req.Data.Limits)
+			if err != nil {
+				return err
+			}
+		}
+	}
+	if !updated {
+		v := parser.ParseTrafficLimiter(&req.Data)
+		if err := registry.ReplaceTrafficLimiter(name, v); err != nil {
+			if closer, ok := v.(io.Closer); ok {
+				closer.Close()
+			}
+			return err
+		}
 	}
 
 	config.OnUpdate(func(c *config.Config) error {
@@ -65,6 +103,8 @@ func updateLimiter(req updateLimiterRequest) error {
 }
 
 func deleteLimiter(req deleteLimiterRequest) error {
+	limiterConfigMu.Lock()
+	defer limiterConfigMu.Unlock()
 
 	name := strings.TrimSpace(req.Limiter)
 
@@ -86,6 +126,16 @@ func deleteLimiter(req deleteLimiterRequest) error {
 	})
 
 	return nil
+}
+
+func sameLimiterPolicy(old, next *config.LimiterConfig) bool {
+	if old == nil || next == nil || old.Plugin != nil || next.Plugin != nil {
+		return false
+	}
+	a, b := *old, *next
+	a.Name, b.Name = "", ""
+	a.Limits, b.Limits = nil, nil
+	return reflect.DeepEqual(a, b)
 }
 
 type createLimiterRequest struct {

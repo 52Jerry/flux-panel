@@ -77,7 +77,13 @@ func Track(a, b io.ReadWriter) func() {
 	var done []func()
 	for _, rw := range []io.ReadWriter{a, b} {
 		conn, ok := rw.(net.Conn)
-		if !ok || conn.LocalAddr() == nil || !strings.HasPrefix(conn.LocalAddr().Network(), "tcp") {
+		if !ok {
+			continue
+		}
+		// Userspace connections may lose their address while Close races with
+		// transfer startup. Read it once rather than checking and fetching again.
+		addr := conn.LocalAddr()
+		if addr == nil || !strings.HasPrefix(addr.Network(), "tcp") {
 			continue
 		}
 		done = append(done, active.track(conn))

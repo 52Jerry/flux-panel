@@ -98,6 +98,7 @@ type trafficLimiter struct {
 	inLimits   *cache.Cache
 	outLimits  *cache.Cache
 	mu         sync.RWMutex
+	reloadMu   sync.Mutex
 	cancelFunc context.CancelFunc
 	ctx        context.Context
 	closeOnce  sync.Once
@@ -314,6 +315,55 @@ func (l *trafficLimiter) periodReload(ctx context.Context) error {
 }
 
 func (l *trafficLimiter) reload(ctx context.Context) error {
+	l.reloadMu.Lock()
+	defer l.reloadMu.Unlock()
+	return l.reloadLocked(ctx)
+}
+
+// TryUpdateLimits preserves active buckets for rate-only changes. Rules that
+// add/remove a key or enable/disable a direction require replacing the limiter.
+// Loader-backed policies are intentionally excluded from this fast path.
+func (l *trafficLimiter) TryUpdateLimits(limits []string) (bool, error) {
+	l.reloadMu.Lock()
+	defer l.reloadMu.Unlock()
+	if err := l.ctx.Err(); err != nil {
+		return false, err
+	}
+	if l.options.fileLoader != nil || l.options.redisLoader != nil || l.options.httpLoader != nil {
+		return false, nil
+	}
+	shape := func(rules []string) map[string][2]bool {
+		result := make(map[string][2]bool)
+		for _, rule := range rules {
+			key, in, out := l.parseLimit(rule)
+			if key != "" {
+				result[key] = [2]bool{in > 0, out > 0}
+			}
+		}
+		return result
+	}
+	before, after := shape(l.options.limits), shape(limits)
+	if len(before) != len(after) {
+		return false, nil
+	}
+	for key, enabled := range before {
+		if next, ok := after[key]; !ok || next != enabled {
+			return false, nil
+		}
+	}
+	previous := l.options.limits
+	l.options.limits = append([]string(nil), limits...)
+	if err := l.reloadLocked(l.ctx); err != nil {
+		l.options.limits = previous
+		return false, err
+	}
+	return true, nil
+}
+
+func (l *trafficLimiter) reloadLocked(ctx context.Context) error {
+	if err := l.ctx.Err(); err != nil {
+		return err
+	}
 	values, err := l.load(ctx)
 	if err != nil {
 		return err
@@ -622,6 +672,8 @@ func (l *trafficLimiter) parseLimit(s string) (key string, in, out int) {
 func (l *trafficLimiter) Close() error {
 	l.closeOnce.Do(func() {
 		l.cancelFunc()
+		l.reloadMu.Lock()
+		defer l.reloadMu.Unlock()
 		l.connInLimits.Flush()
 		l.connOutLimits.Flush()
 		l.inLimits.Flush()

@@ -3,6 +3,7 @@ package net
 import (
 	"errors"
 	"io"
+	stdnet "net"
 	"os"
 	"sync"
 	"time"
@@ -13,6 +14,7 @@ import (
 )
 
 const bufferSize = 64 * 1024
+const streamBufferSize = 32 * 1024
 
 // DefaultWriteTimeout applies to forward/relay handlers, not the legacy API.
 const DefaultWriteTimeout = 60 * time.Second
@@ -62,13 +64,17 @@ func TransportWithOptions(rw1, rw2 io.ReadWriter, opts TransportOptions) error {
 		idle.progress()
 	}}
 	errc := make(chan error, 2)
+	size := bufferSize
+	if streamEndpoint(rw1) && streamEndpoint(rw2) {
+		size = streamBufferSize
+	}
 	copyOne := func(dst io.Writer, src io.Reader) {
-		err := copyTransport(dst, src, writeOpts, idle.progress)
+		err := copyTransport(dst, src, writeOpts, idle.progress, size)
 		closeBoth()
 		errc <- err
 	}
 	go copyOne(rw1, rw2)
-	go copyOne(rw2, rw1)
+	copyOne(rw2, rw1)
 	var err error
 	for i := 0; i < 2; i++ {
 		if e := <-errc; e != nil && e != io.EOF {
@@ -84,8 +90,24 @@ func TransportWithOptions(rw1, rw2 io.ReadWriter, opts TransportOptions) error {
 	return err
 }
 
-func copyTransport(dst io.Writer, src io.Reader, opts WriteOptions, onRead func()) error {
-	buf := bufpool.Get(bufferSize)
+func streamEndpoint(rw io.ReadWriter) bool {
+	c, ok := rw.(stdnet.Conn)
+	if !ok {
+		return false
+	}
+	addr := c.RemoteAddr()
+	if addr == nil {
+		return false
+	}
+	switch addr.Network() {
+	case "tcp", "tcp4", "tcp6", "unix", "pipe":
+		return true
+	}
+	return false
+}
+
+func copyTransport(dst io.Writer, src io.Reader, opts WriteOptions, onRead func(), size int) error {
+	buf := bufpool.Get(size)
 	defer bufpool.Put(buf)
 	emptyReads := 0
 	for {

@@ -7,6 +7,7 @@ import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContai
 
 
 import { getUserPackageInfo } from "@/api";
+import { dashboardFlowData, type FlowSnapshot } from "@/utils/dashboard-flow";
 
 interface UserInfo {
   flow: number;
@@ -49,20 +50,13 @@ interface AddressItem {
   copying: boolean;
 }
 
-interface StatisticsFlow {
-  id: number;
-  userId: number;
-  flow: number;
-  totalFlow: number;
-  time: string;
-}
-
 export default function DashboardPage() {
   const [loading, setLoading] = useState(true);
   const [userInfo, setUserInfo] = useState<UserInfo>({} as UserInfo);
   const [userTunnels, setUserTunnels] = useState<UserTunnel[]>([]);
   const [forwardList, setForwardList] = useState<Forward[]>([]);
-  const [statisticsFlows, setStatisticsFlows] = useState<StatisticsFlow[]>([]);
+  const [statisticsFlows, setStatisticsFlows] = useState<FlowSnapshot[]>([]);
+  const [observedAt, setObservedAt] = useState(Date.now());
   const [isAdmin, setIsAdmin] = useState(false);
   
   const [addressModalOpen, setAddressModalOpen] = useState(false);
@@ -171,20 +165,49 @@ export default function DashboardPage() {
     const adminStatus = localStorage.getItem('admin');
     setIsAdmin(adminStatus === 'true');
     
-    loadPackageData();
+    let stopped = false;
+    let pending = false;
+    let initial = true;
+    let refresh: ReturnType<typeof setTimeout> | undefined;
+    const poll = async () => {
+      if (stopped || pending || document.hidden) return;
+      pending = true;
+      try {
+        await loadPackageData(initial, () => stopped);
+        initial = false;
+      } finally {
+        pending = false;
+        if (!stopped) refresh = setTimeout(poll, 30000);
+      }
+    };
+    void poll();
+    const onVisible = () => {
+      clearTimeout(refresh);
+      if (!document.hidden) {
+        void poll();
+      }
+    };
+    document.addEventListener('visibilitychange', onVisible);
     localStorage.setItem('e', '/dashboard');
+    return () => {
+      stopped = true;
+      clearTimeout(refresh);
+      document.removeEventListener('visibilitychange', onVisible);
+    };
   }, []);
 
-  const loadPackageData = async () => {
-    setLoading(true);
+  const loadPackageData = async (initial = true, cancelled = () => false) => {
+    if (initial) setLoading(true);
     try {
       const res = await getUserPackageInfo();
+      if (cancelled()) return;
       if (res.code === 0) {
         const data = res.data;
         setUserInfo(data.userInfo || {});
         setUserTunnels(data.tunnelPermissions || []);
         setForwardList(data.forwards || []);
         setStatisticsFlows(data.statisticsFlows || []);
+        setObservedAt(Date.now());
         
         // 检查有效期并显示通知
         checkExpirationNotifications(data.userInfo, data.tunnelPermissions || []);
@@ -192,10 +215,11 @@ export default function DashboardPage() {
         toast.error(res.msg || '获取套餐信息失败');
       }
     } catch (error) {
+      if (cancelled()) return;
       console.error('获取套餐信息失败:', error);
       toast.error('获取套餐信息失败');
     } finally {
-      setLoading(false);
+      if (!cancelled() && initial) setLoading(false);
     }
   };
 
@@ -226,28 +250,7 @@ export default function DashboardPage() {
 
   // 处理24小时流量统计数据
   const processFlowChartData = () => {
-    // 生成最近24小时的时间数组（从当前小时往前推24小时）
-    const now = new Date();
-    const hours: string[] = [];
-    for (let i = 23; i >= 0; i--) {
-      const time = new Date(now.getTime() - i * 60 * 60 * 1000);
-      const hourString = time.getHours().toString().padStart(2, '0') + ':00';
-      hours.push(hourString);
-    }
-
-    // 创建数据映射
-    const flowMap = new Map<string, number>();
-    statisticsFlows.forEach(item => {
-      flowMap.set(item.time, item.flow || 0);
-    });
-
-    // 生成图表数据，没有数据的小时显示为0
-    return hours.map(hour => ({
-      time: hour,
-      flow: flowMap.get(hour) || 0,
-      // 格式化显示用的流量值
-      formattedFlow: formatFlow(flowMap.get(hour) || 0)
-    }));
+    return dashboardFlowData(statisticsFlows, (userInfo.inFlow || 0) + (userInfo.outFlow || 0), observedAt);
   };
 
 
@@ -692,6 +695,7 @@ export default function DashboardPage() {
              </div>
            </CardHeader>
            <CardBody className="pt-0">
+             <p className="text-xs text-default-500 mb-3">按自然小时统计，当前小时实时累计；每30秒刷新。缺失快照显示为断点。</p>
              {statisticsFlows.length === 0 ? (
                <div className="text-center py-12">
                  <svg className="w-12 h-12 text-default-400 mx-auto mb-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -732,7 +736,7 @@ export default function DashboardPage() {
                                  <div className="bg-white dark:bg-default-100 border border-default-200 rounded-lg shadow-lg p-3">
                                    <p className="font-medium text-foreground">{`时间: ${label}`}</p>
                                    <p className="text-primary">
-                                     {`流量: ${formatFlow(payload[0]?.value as number || 0)}`}
+                                     {`流量: ${formatFlow(payload[0]?.value as number || 0)}${payload[0]?.payload?.isCurrent ? '（本小时累计）' : ''}`}
                                    </p>
                                  </div>
                                );
@@ -955,4 +959,4 @@ export default function DashboardPage() {
       </div>
           
   );
-} 
+}

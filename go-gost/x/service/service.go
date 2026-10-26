@@ -437,7 +437,7 @@ func (s *defaultService) setState(state State) {
 }
 
 func (s *defaultService) observeStats(ctx context.Context) {
-	if s.options.observer == nil {
+	if strings.HasSuffix(s.name, "_tls") || (s.options.observer == nil && httpReportURL == "") {
 		return
 	}
 
@@ -458,12 +458,11 @@ func (s *defaultService) observeStats(ctx context.Context) {
 		select {
 		case <-ticker.C:
 
-			// First, try to send any pending events
+			// Observer delivery must not block independent panel accounting.
 			if len(events) > 0 {
 				if err := s.options.observer.Observe(ctx, events); err == nil {
 					events = nil
 				}
-				continue
 			}
 
 			st := s.status.Stats()
@@ -472,9 +471,10 @@ func (s *defaultService) observeStats(ctx context.Context) {
 			}
 
 			isUpdated := st.IsUpdated()
-			if isUpdated {
-				inputBytes := st.Get(stats.KindInputBytes)
-				outputBytes := st.Get(stats.KindOutputBytes)
+			inputBytes := st.Get(stats.KindInputBytes)
+			outputBytes := st.Get(stats.KindOutputBytes)
+			// Retain and retry an unacknowledged snapshot even on a quiet socket.
+			if isUpdated || inputBytes > 0 || outputBytes > 0 {
 
 				evs := []observer.Event{
 					xstats.StatsEvent{
@@ -487,7 +487,7 @@ func (s *defaultService) observeStats(ctx context.Context) {
 						TotalErrs:    st.Get(stats.KindTotalErrs),
 					},
 				}
-				if outputBytes > 0 || inputBytes > 0 {
+				if httpReportURL != "" && (outputBytes > 0 || inputBytes > 0) {
 					reportItems := TrafficReportItem{
 						N: s.name,
 						U: int64(outputBytes),
@@ -498,14 +498,16 @@ func (s *defaultService) observeStats(ctx context.Context) {
 						fmt.Printf("发送流量报告失败: %v", err)
 					} else if success {
 						if xstats, ok := st.(*xstats.Stats); ok {
-							xstats.ResetTraffic(st.Get(stats.KindInputBytes)-inputBytes, st.Get(stats.KindOutputBytes)-outputBytes)
+							xstats.AcknowledgeTraffic(inputBytes, outputBytes)
 						}
 					}
 				}
 
-				if err := s.options.observer.Observe(ctx, evs); err != nil {
-					fmt.Printf("发送观察器事件失败: %v", err)
-					events = evs
+				if s.options.observer != nil && len(events) == 0 {
+					if err := s.options.observer.Observe(ctx, evs); err != nil {
+						fmt.Printf("发送观察器事件失败: %v", err)
+						events = evs
+					}
 				}
 			}
 

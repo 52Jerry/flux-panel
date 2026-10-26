@@ -39,6 +39,7 @@ var (
 	apiAddr      string
 	metricsAddr  string
 	standalone   bool
+	reportConfig string
 	printVersion bool
 )
 
@@ -97,6 +98,7 @@ func init() {
 	flag.StringVar(&apiAddr, "api", "", "api service address")
 	flag.StringVar(&metricsAddr, "metrics", "", "metrics service address")
 	flag.BoolVar(&standalone, "standalone", false, "run local configuration without a panel connection")
+	flag.StringVar(&reportConfig, "report-config", "", "panel credentials for traffic-only reporting in standalone mode")
 }
 
 func main() {
@@ -108,6 +110,10 @@ func main() {
 	}
 	log := xlogger.NewLogger()
 	logger.SetDefault(log)
+	if err := configureStandaloneReporting(standalone, reportConfig); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
 	if !standalone {
 		// 加载配置文件
 		config, err := LoadConfig("config.json")

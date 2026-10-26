@@ -71,6 +71,13 @@ func (s *Stats) ResetTraffic(reportedInputBytes, reportedOutputBytes uint64) {
 	s.outputBytes.Store(reportedOutputBytes)
 }
 
+// AcknowledgeTraffic removes only the snapshot accepted by the panel. Atomic
+// subtraction preserves bytes added while the HTTP request was in flight.
+func (s *Stats) AcknowledgeTraffic(input, output uint64) {
+	s.inputBytes.Add(^input + 1)
+	s.outputBytes.Add(^output + 1)
+}
+
 func (s *Stats) Reset() {
 	s.updated.Store(false)
 	s.totalConns.Store(0)

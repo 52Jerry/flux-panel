@@ -13,7 +13,6 @@ import (
 	xnet "github.com/go-gost/x/internal/net"
 	"github.com/go-gost/x/internal/net/proxyproto"
 	"github.com/go-gost/x/internal/util/mux"
-	mdutil "github.com/go-gost/x/metadata/util"
 	metrics "github.com/go-gost/x/metrics/wrapper"
 )
 
@@ -57,9 +56,10 @@ func (l *tcpListener) Close() error {
 }
 
 type tcpHandler struct {
-	session *mux.Session
-	options handler.Options
-	md      md.Metadata
+	session          *mux.Session
+	options          handler.Options
+	md               md.Metadata
+	transportOptions xnet.TransportOptions
 }
 
 func newTCPHandler(session *mux.Session, opts ...handler.Option) handler.Handler {
@@ -76,6 +76,12 @@ func newTCPHandler(session *mux.Session, opts ...handler.Option) handler.Handler
 
 func (h *tcpHandler) Init(md md.Metadata) (err error) {
 	h.md = md
+	h.transportOptions.WriteTimeout, err = xnet.TransportTimeout(md, "writeTimeout", xnet.DefaultWriteTimeout)
+	if err != nil {
+		return err
+	}
+	// Preserve the entrypoint's existing opt-in idle timeout.
+	h.transportOptions.IdleTimeout, err = xnet.TransportTimeout(md, "idleTimeout", 0)
 	return
 }
 
@@ -116,8 +122,7 @@ func (h *tcpHandler) Handle(ctx context.Context, conn net.Conn, opts ...handler.
 
 	t := time.Now()
 	log.Debugf("%s <-> %s", conn.RemoteAddr(), cc.RemoteAddr())
-	idleSecs := int(mdutil.GetDuration(h.md, "idleTimeout").Seconds())
-	xnet.TransportWithIdleTimeout(conn, cc, idleSecs)
+	xnet.TransportWithOptions(conn, cc, h.transportOptions)
 	log.WithFields(map[string]any{"duration": time.Since(t)}).
 		Debugf("%s >-< %s", conn.RemoteAddr(), cc.RemoteAddr())
 	return nil

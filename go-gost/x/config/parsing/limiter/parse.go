@@ -15,6 +15,8 @@ import (
 	xrate "github.com/go-gost/x/limiter/rate"
 	xtraffic "github.com/go-gost/x/limiter/traffic"
 	traffic_plugin "github.com/go-gost/x/limiter/traffic/plugin"
+	"github.com/go-gost/x/metadata"
+	mdutil "github.com/go-gost/x/metadata/util"
 )
 
 func ParseTrafficLimiter(cfg *config.LimiterConfig) (lim traffic.TrafficLimiter) {
@@ -47,6 +49,13 @@ func ParseTrafficLimiter(cfg *config.LimiterConfig) (lim traffic.TrafficLimiter)
 	}
 
 	var opts []xtraffic.Option
+	md := metadata.NewMetadata(cfg.Metadata)
+	if burst := mdutil.GetDuration(md, "traffic.burst"); burst > 0 {
+		opts = append(opts, xtraffic.BurstOption(burst))
+	}
+	if mode := mdutil.GetString(md, "traffic.fairness"); mode != "" {
+		opts = append(opts, xtraffic.FairnessOption(mode))
+	}
 
 	if cfg.File != nil && cfg.File.Path != "" {
 		opts = append(opts, xtraffic.FileLoaderOption(loader.FileLoader(cfg.File.Path)))
@@ -77,10 +86,14 @@ func ParseTrafficLimiter(cfg *config.LimiterConfig) (lim traffic.TrafficLimiter)
 			loader.TimeoutHTTPLoaderOption(cfg.HTTP.Timeout),
 		)))
 	}
+	log := logger.Default()
+	if log == nil {
+		log = logger.LoggerGroup()
+	}
 	opts = append(opts,
 		xtraffic.LimitsOption(cfg.Limits...),
 		xtraffic.ReloadPeriodOption(cfg.Reload),
-		xtraffic.LoggerOption(logger.Default().WithFields(map[string]any{
+		xtraffic.LoggerOption(log.WithFields(map[string]any{
 			"kind":    "limiter",
 			"limiter": cfg.Name,
 		})),

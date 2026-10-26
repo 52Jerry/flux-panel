@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "test:node-config": "node --test tests/node-config.test.mjs",
+    "test:congestion": "node --test tests/node-congestion.test.mjs",
     "test:resources": "node --test tests/resource-lifecycle.test.mjs",
     "test:node-page": "node tests/node-page.browser.mjs",
     "dev": "vite",

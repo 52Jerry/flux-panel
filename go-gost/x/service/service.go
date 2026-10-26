@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/go-gost/core/admission"
@@ -536,6 +537,19 @@ type detectConn struct {
 	net.Conn
 	reader   *bufio.Reader
 	detected bool
+}
+
+func (c *detectConn) SyscallConn() (syscall.RawConn, error) {
+	if conn, ok := c.Conn.(syscall.Conn); ok {
+		return conn.SyscallConn()
+	}
+	return nil, errors.New("connection does not expose a kernel socket")
+}
+
+func (c *detectConn) NetConn() net.Conn { return c.Conn }
+
+func (c *detectConn) WriteWithOptions(p []byte, opts xnet.WriteOptions) (int, error) {
+	return xnet.WriteWithOptions(c.Conn, p, opts)
 }
 
 func (c *detectConn) Read(b []byte) (int, error) {

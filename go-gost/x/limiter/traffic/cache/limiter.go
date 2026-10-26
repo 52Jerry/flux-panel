@@ -1,7 +1,9 @@
 package limiter
 
 import (
+	"container/list"
 	"context"
+	"sync"
 	"time"
 
 	"github.com/go-gost/core/limiter"
@@ -41,8 +43,8 @@ func ScopeOption(scope string) Option {
 }
 
 type cachedTrafficLimiter struct {
-	inLimits  *cache.Cache
-	outLimits *cache.Cache
+	inLimits  *boundedCache
+	outLimits *boundedCache
 	limiter   traffic.TrafficLimiter
 	options   options
 }
@@ -72,8 +74,8 @@ func NewCachedTrafficLimiter(limiter traffic.TrafficLimiter, opts ...Option) tra
 	}
 
 	lim := &cachedTrafficLimiter{
-		inLimits:  cache.NewCache(options.cleanupInterval),
-		outLimits: cache.NewCache(options.cleanupInterval),
+		inLimits:  newBoundedCache(),
+		outLimits: newBoundedCache(),
 		limiter:   limiter,
 		options:   options,
 	}
@@ -94,22 +96,23 @@ func (p *cachedTrafficLimiter) In(ctx context.Context, key string, opts ...limit
 		return nil
 	}
 
-	item := p.inLimits.Get(key)
+	cacheKey := options.Scope + "\x00" + options.Service + "\x00" + key
+	item := p.inLimits.Get(cacheKey)
 	lim, _ := item.Value().(traffic.Limiter)
-	if !item.Expired() {
+	if !item.Expired() && !isClosed(lim) {
 		return lim
 	}
 
 	limNew := p.limiter.In(ctx, key, opts...)
-	if limNew == nil {
+	if limNew == nil && !isClosed(lim) {
 		limNew = lim
 	}
 	if item == nil || !p.equal(lim, limNew) {
-		p.inLimits.Set(key, cache.NewItem(limNew, p.options.refreshInterval))
+		p.inLimits.Set(cacheKey, cache.NewItem(limNew, p.options.refreshInterval))
 		return limNew
 	}
 
-	p.inLimits.Set(key, cache.NewItem(lim, p.options.refreshInterval))
+	p.inLimits.Set(cacheKey, cache.NewItem(lim, p.options.refreshInterval))
 
 	return lim
 }
@@ -128,22 +131,23 @@ func (p *cachedTrafficLimiter) Out(ctx context.Context, key string, opts ...limi
 		return nil
 	}
 
-	item := p.outLimits.Get(key)
+	cacheKey := options.Scope + "\x00" + options.Service + "\x00" + key
+	item := p.outLimits.Get(cacheKey)
 	lim, _ := item.Value().(traffic.Limiter)
-	if !item.Expired() {
+	if !item.Expired() && !isClosed(lim) {
 		return lim
 	}
 
 	limNew := p.limiter.Out(ctx, key, opts...)
-	if limNew == nil {
+	if limNew == nil && !isClosed(lim) {
 		limNew = lim
 	}
 	if item == nil || !p.equal(lim, limNew) {
-		p.outLimits.Set(key, cache.NewItem(limNew, p.options.refreshInterval))
+		p.outLimits.Set(cacheKey, cache.NewItem(limNew, p.options.refreshInterval))
 		return limNew
 	}
 
-	p.outLimits.Set(key, cache.NewItem(lim, p.options.refreshInterval))
+	p.outLimits.Set(cacheKey, cache.NewItem(lim, p.options.refreshInterval))
 
 	return lim
 }
@@ -156,6 +160,53 @@ func (p *cachedTrafficLimiter) equal(lim1, lim2 traffic.Limiter) bool {
 	if lim1 == nil || lim2 == nil {
 		return false
 	}
+	if first, ok := lim1.(interface{ CacheIdentity() any }); ok {
+		second, sameKind := lim2.(interface{ CacheIdentity() any })
+		return sameKind && first.CacheIdentity() == second.CacheIdentity()
+	}
 
 	return lim1.Limit() == lim2.Limit()
+}
+
+func isClosed(lim traffic.Limiter) bool {
+	closed, ok := lim.(interface{ Closed() bool })
+	return ok && closed.Closed()
+}
+
+const maxCachedLimits = 4096
+
+type boundedCache struct {
+	mu     sync.Mutex
+	items  map[string]*boundedEntry
+	recent list.List
+}
+type boundedEntry struct {
+	item     *cache.Item
+	position *list.Element
+}
+
+func newBoundedCache() *boundedCache { return &boundedCache{items: make(map[string]*boundedEntry)} }
+func (c *boundedCache) Get(key string) *cache.Item {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if entry := c.items[key]; entry != nil {
+		c.recent.MoveToFront(entry.position)
+		return entry.item
+	}
+	return nil
+}
+func (c *boundedCache) Set(key string, item *cache.Item) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if entry := c.items[key]; entry != nil {
+		entry.item = item
+		c.recent.MoveToFront(entry.position)
+		return
+	}
+	if len(c.items) >= maxCachedLimits {
+		oldest := c.recent.Back()
+		delete(c.items, oldest.Value.(string))
+		c.recent.Remove(oldest)
+	}
+	c.items[key] = &boundedEntry{item: item, position: c.recent.PushFront(key)}
 }

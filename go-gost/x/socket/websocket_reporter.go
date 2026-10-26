@@ -26,11 +26,12 @@ import (
 
 // SystemInfo 系统信息结构体
 type SystemInfo struct {
-	Uptime           uint64  `json:"uptime"`            // 开机时间	（秒）
-	BytesReceived    uint64  `json:"bytes_received"`    // 接收字节数
-	BytesTransmitted uint64  `json:"bytes_transmitted"` // 发送字节数
-	CPUUsage         float64 `json:"cpu_usage"`         // CPU使用率（百分比）
-	MemoryUsage      float64 `json:"memory_usage"`      // 内存使用率（百分比）
+	Uptime           uint64          `json:"uptime"`            // 开机时间	（秒）
+	BytesReceived    uint64          `json:"bytes_received"`    // 接收字节数
+	BytesTransmitted uint64          `json:"bytes_transmitted"` // 发送字节数
+	CPUUsage         float64         `json:"cpu_usage"`         // CPU使用率（百分比）
+	MemoryUsage      float64         `json:"memory_usage"`      // 内存使用率（百分比）
+	Congestion       *CongestionInfo `json:"congestion,omitempty"`
 }
 
 // NetworkStats 网络统计信息
@@ -344,6 +345,7 @@ func (w *WebSocketReporter) collectSystemInfo() SystemInfo {
 		BytesTransmitted: networkStats.BytesTransmitted,
 		CPUUsage:         cpuInfo.Usage,
 		MemoryUsage:      memoryInfo.Usage,
+		Congestion:       collectCongestionInfo(),
 	}
 }
 

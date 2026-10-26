@@ -3,6 +3,11 @@
 Run configuration tests with `npm run test:node-config` and compile with
 `npm run build`.
 
+Run `npm run test:congestion` for optional congestion telemetry parsing and detail
+rendering. Missing/null metrics remain unavailable; unsupported or empty kernel
+samples cannot appear as zero RTT, retransmissions, or send queue. These tests
+also cover partial samples, sampling limits, measured zeroes, and legacy reports.
+
 Run `npm run test:resources` for HTTP 401 settlement, CAPTCHA refresh/abort/
 timeout and stale-callback handling, and bulk-import batching/pagination.
 These tests use the actual vendored CAPTCHA renderer with a mocked XHR; they

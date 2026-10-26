@@ -50,6 +50,12 @@ func (c *serverConn) SyscallConn() (rc syscall.RawConn, err error) {
 	return
 }
 
+func (c *serverConn) NetConn() net.Conn { return c.Conn }
+
+func (c *serverConn) WriteWithOptions(p []byte, opts xnet.WriteOptions) (int, error) {
+	return xnet.WriteWithOptions(c.Conn, p, opts)
+}
+
 func (c *serverConn) Metadata() metadata.Metadata {
 	if md, ok := c.Conn.(metadata.Metadatable); ok {
 		return md.Metadata()
@@ -98,6 +104,13 @@ func (c *packetConn) Metadata() metadata.Metadata {
 type udpConn struct {
 	net.PacketConn
 	admission admission.Admission
+}
+
+func (c *udpConn) WriteWithOptions(p []byte, opts xnet.WriteOptions) (int, error) {
+	if writer, ok := c.PacketConn.(io.Writer); ok {
+		return xnet.WriteWithOptions(writer, p, opts)
+	}
+	return 0, errUnsupport
 }
 
 func WrapUDPConn(admission admission.Admission, pc net.PacketConn) udp.Conn {

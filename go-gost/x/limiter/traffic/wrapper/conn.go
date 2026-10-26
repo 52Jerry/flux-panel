@@ -49,11 +49,28 @@ func (l *connLifetime) wait(limiter traffic.Limiter, n int) int {
 	return limit
 }
 
+// Datagram boundaries are preserved: accumulate byte grants before one socket
+// write instead of silently dropping packets larger than a pacing quantum.
+func (l *connLifetime) waitPacket(limiter traffic.Limiter, n int) error {
+	for remaining := n; remaining > 0; {
+		granted := l.wait(limiter, remaining)
+		if l.ctx.Err() != nil {
+			return net.ErrClosed
+		}
+		if granted <= 0 {
+			return io.ErrNoProgress
+		}
+		remaining -= granted
+	}
+	return nil
+}
+
 // limitConn is a Conn with traffic limiter supported.
 type limitConn struct {
 	net.Conn
 	life    connLifetime
 	rbuf    bytes.Buffer
+	readErr error
 	limiter traffic.TrafficLimiter
 	opts    []limiter.Option
 	key     string
@@ -73,11 +90,23 @@ func WrapConn(c net.Conn, tlimiter traffic.TrafficLimiter, key string, opts ...l
 	}
 }
 
-func (c *limitConn) Close() error { return c.life.close(c.Conn) }
+func (c *limitConn) Close() error      { return c.life.close(c.Conn) }
+func (c *limitConn) NetConn() net.Conn { return c.Conn }
 
 func (c *limitConn) Read(b []byte) (n int, err error) {
+	if len(b) == 0 {
+		return 0, nil
+	}
 	limiter := c.limiter.In(c.life.ctx, c.key, c.opts...)
 	if limiter == nil || limiter.Limit() <= 0 {
+		if c.rbuf.Len() > 0 {
+			n, err = c.rbuf.Read(b)
+			if c.rbuf.Len() == 0 && c.readErr != nil {
+				err = c.readErr
+				c.readErr = nil
+			}
+			return
+		}
 		return c.Conn.Read(b)
 	}
 
@@ -90,31 +119,49 @@ func (c *limitConn) Read(b []byte) (n int, err error) {
 		if c.life.ctx.Err() != nil {
 			return 0, net.ErrClosed
 		}
-		return c.rbuf.Read(b[:lim])
+		if lim <= 0 {
+			return 0, io.ErrNoProgress
+		}
+		n, err = c.rbuf.Read(b[:lim])
+		if c.rbuf.Len() == 0 && c.readErr != nil {
+			err = c.readErr
+			c.readErr = nil
+		}
+		return
 	}
 
-	nn, err := c.Conn.Read(b)
-	if err != nil {
-		return nn, err
+	nn, readErr := c.Conn.Read(b)
+	if nn == 0 {
+		return 0, readErr
 	}
 
 	n = c.life.wait(limiter, nn)
 	if c.life.ctx.Err() != nil {
 		return 0, net.ErrClosed
 	}
+	if n <= 0 && nn > 0 {
+		return 0, io.ErrNoProgress
+	}
 	if n < nn {
 		if _, err = c.rbuf.Write(b[n:nn]); err != nil {
 			return 0, err
 		}
+		c.readErr = readErr
+	} else {
+		err = readErr
 	}
 
 	return
 }
 
 func (c *limitConn) Write(b []byte) (n int, err error) {
+	return c.WriteWithOptions(b, xnet.WriteOptions{})
+}
+
+func (c *limitConn) WriteWithOptions(b []byte, options xnet.WriteOptions) (n int, err error) {
 	limiter := c.limiter.Out(c.life.ctx, c.key, c.opts...)
 	if limiter == nil || limiter.Limit() <= 0 {
-		return c.Conn.Write(b)
+		return xnet.WriteWithOptions(c.Conn, b, options)
 	}
 
 	nn := 0
@@ -126,10 +173,13 @@ func (c *limitConn) Write(b []byte) (n int, err error) {
 		if limit <= 0 {
 			return n, io.ErrNoProgress
 		}
-		nn, err = c.Conn.Write(b[:limit])
+		nn, err = xnet.WriteWithOptions(c.Conn, b[:limit], options)
 		n += nn
 		if err != nil {
 			return
+		}
+		if nn <= 0 {
+			return n, io.ErrNoProgress
 		}
 		b = b[nn:]
 	}
@@ -188,9 +238,9 @@ func (c *packetConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
 			return
 		}
 
-		// discard when exceed the limit size.
-		if c.life.wait(limiter, n) < n {
-			continue
+		if err = c.life.waitPacket(limiter, n); err != nil {
+			n = 0
+			return
 		}
 
 		return
@@ -198,12 +248,12 @@ func (c *packetConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
 }
 
 func (c *packetConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
-	// discard when exceed the limit size.
+	// Charge the complete datagram without fragmenting the socket write.
 	limiter := c.limiter.Out(c.life.ctx, c.key, c.opts...)
-	if limiter != nil && limiter.Limit() > 0 &&
-		c.life.wait(limiter, len(p)) < len(p) {
-		n = len(p)
-		return
+	if limiter != nil && limiter.Limit() > 0 {
+		if err = c.life.waitPacket(limiter, len(p)); err != nil {
+			return
+		}
 	}
 
 	return c.PacketConn.WriteTo(p, addr)
@@ -279,9 +329,9 @@ func (c *udpConn) Read(b []byte) (n int, err error) {
 			return
 		}
 
-		// discard when exceed the limit size.
-		if c.life.wait(limiter, n) < n {
-			continue
+		if err = c.life.waitPacket(limiter, n); err != nil {
+			n = 0
+			return
 		}
 
 		return
@@ -304,9 +354,9 @@ func (c *udpConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
 			return
 		}
 
-		// discard when exceed the limit size.
-		if c.life.wait(limiter, n) < n {
-			continue
+		if err = c.life.waitPacket(limiter, n); err != nil {
+			n = 0
+			return
 		}
 
 		return
@@ -335,9 +385,9 @@ func (c *udpConn) ReadFromUDP(b []byte) (n int, addr *net.UDPAddr, err error) {
 			return
 		}
 
-		// discard when exceed the limit size.
-		if c.life.wait(limiter, n) < n {
-			continue
+		if err = c.life.waitPacket(limiter, n); err != nil {
+			n = 0
+			return
 		}
 
 		return
@@ -366,15 +416,19 @@ func (c *udpConn) ReadMsgUDP(b, oob []byte) (n, oobn, flags int, addr *net.UDPAd
 			return
 		}
 
-		// discard when exceed the limit size.
-		if c.life.wait(limiter, n) < n {
-			continue
+		if err = c.life.waitPacket(limiter, n); err != nil {
+			n = 0
+			return
 		}
 		return
 	}
 }
 
 func (c *udpConn) Write(p []byte) (n int, err error) {
+	return c.WriteWithOptions(p, xnet.WriteOptions{})
+}
+
+func (c *udpConn) WriteWithOptions(p []byte, options xnet.WriteOptions) (n int, err error) {
 	nc, ok := c.PacketConn.(io.Writer)
 	if !ok {
 		err = errUnsupport
@@ -382,27 +436,27 @@ func (c *udpConn) Write(p []byte) (n int, err error) {
 	}
 
 	if c.limiter != nil {
-		// discard when exceed the limit size.
+		// Charge the complete datagram without fragmenting the socket write.
 		limiter := c.limiter.Out(c.life.ctx, c.key, c.opts...)
-		if limiter != nil && limiter.Limit() > 0 &&
-			c.life.wait(limiter, len(p)) < len(p) {
-			n = len(p)
-			return
+		if limiter != nil && limiter.Limit() > 0 {
+			if err = c.life.waitPacket(limiter, len(p)); err != nil {
+				return
+			}
 		}
 	}
 
-	n, err = nc.Write(p)
+	n, err = xnet.WriteWithOptions(nc, p, options)
 	return
 }
 
 func (c *udpConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 	if c.limiter != nil {
-		// discard when exceed the limit size.
+		// Charge the complete datagram without fragmenting the socket write.
 		limiter := c.limiter.Out(c.life.ctx, c.key, c.opts...)
-		if limiter != nil && limiter.Limit() > 0 &&
-			c.life.wait(limiter, len(p)) < len(p) {
-			n = len(p)
-			return
+		if limiter != nil && limiter.Limit() > 0 {
+			if err = c.life.waitPacket(limiter, len(p)); err != nil {
+				return
+			}
 		}
 	}
 
@@ -418,12 +472,12 @@ func (c *udpConn) WriteToUDP(p []byte, addr *net.UDPAddr) (n int, err error) {
 	}
 
 	if c.limiter != nil {
-		// discard when exceed the limit size.
+		// Charge the complete datagram without fragmenting the socket write.
 		limiter := c.limiter.Out(c.life.ctx, c.key, c.opts...)
-		if limiter != nil && limiter.Limit() > 0 &&
-			c.life.wait(limiter, len(p)) < len(p) {
-			n = len(p)
-			return
+		if limiter != nil && limiter.Limit() > 0 {
+			if err = c.life.waitPacket(limiter, len(p)); err != nil {
+				return
+			}
 		}
 	}
 
@@ -439,12 +493,12 @@ func (c *udpConn) WriteMsgUDP(p, oob []byte, addr *net.UDPAddr) (n, oobn int, er
 	}
 
 	if c.limiter != nil {
-		// discard when exceed the limit size.
+		// Charge the complete datagram without fragmenting the socket write.
 		limiter := c.limiter.Out(c.life.ctx, c.key, c.opts...)
-		if limiter != nil && limiter.Limit() > 0 &&
-			c.life.wait(limiter, len(p)) < len(p) {
-			n = len(p)
-			return
+		if limiter != nil && limiter.Limit() > 0 {
+			if err = c.life.waitPacket(limiter, len(p)); err != nil {
+				return
+			}
 		}
 	}
 

@@ -46,10 +46,16 @@ func (c *conn) Read(b []byte) (n int, err error) {
 }
 
 func (c *conn) Write(b []byte) (n int, err error) {
-	n, err = c.Conn.Write(b)
+	return c.WriteWithOptions(b, xnet.WriteOptions{})
+}
+
+func (c *conn) WriteWithOptions(b []byte, opts xnet.WriteOptions) (n int, err error) {
+	n, err = xnet.WriteWithOptions(c.Conn, b, opts)
 	c.stats.Add(stats.KindOutputBytes, int64(n))
 	return
 }
+
+func (c *conn) NetConn() net.Conn { return c.Conn }
 
 func (c *conn) Close() error {
 	c.mu.Lock()
@@ -194,8 +200,12 @@ func (c *udpConn) ReadMsgUDP(b, oob []byte) (n, oobn, flags int, addr *net.UDPAd
 }
 
 func (c *udpConn) Write(b []byte) (n int, err error) {
+	return c.WriteWithOptions(b, xnet.WriteOptions{})
+}
+
+func (c *udpConn) WriteWithOptions(b []byte, opts xnet.WriteOptions) (n int, err error) {
 	if nc, ok := c.PacketConn.(io.Writer); ok {
-		n, err = nc.Write(b)
+		n, err = xnet.WriteWithOptions(nc, b, opts)
 		if c.stats != nil {
 			c.stats.Add(stats.KindOutputBytes, int64(n))
 		}

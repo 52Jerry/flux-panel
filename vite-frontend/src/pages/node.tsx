@@ -14,6 +14,9 @@ import toast from 'react-hot-toast';
 import axios from 'axios';
 import { emptyNodeForm, isModernNode, nodeToForm, nodePayload, nodePortLabel, validPorts } from '@/utils/node-config';
 import type { NodeConfig, NodeForm } from '@/utils/node-config';
+import { parseNodeCongestion } from '@/utils/node-congestion';
+import type { NodeCongestion } from '@/utils/node-congestion';
+import { NodeCongestionDetails } from '@/components/node-congestion';
 
 
 import { 
@@ -36,6 +39,7 @@ interface Node extends NodeConfig {
     uploadSpeed: number;
     downloadSpeed: number;
     uptime: number;
+    congestion: NodeCongestion | null;
   } | null;
   copyLoading?: boolean;
 }
@@ -222,7 +226,8 @@ export default function NodePage() {
                 downloadTraffic: currentDownload,
                 uploadSpeed: uploadSpeed,
                 downloadSpeed: downloadSpeed,
-                uptime: currentUptime
+                uptime: currentUptime,
+                congestion: parseNodeCongestion(systemInfo.congestion)
               }
             };
           } catch (error) {
@@ -751,6 +756,8 @@ export default function NodePage() {
                       </div>
                     </div>
                   </div>
+
+                  <NodeCongestionDetails data={node.connectionStatus === 'online' ? node.systemInfo?.congestion : null} />
 
                   {/* 操作按钮 */}
                   <div className="space-y-1.5">

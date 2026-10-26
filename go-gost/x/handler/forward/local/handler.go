@@ -224,7 +224,7 @@ func (h *forwardHandler) Handle(ctx context.Context, conn net.Conn, opts ...hand
 	}
 	defer cc.Close()
 
-	xnet.Transport(conn, cc)
+	xnet.TransportWithOptions(conn, cc, xnet.TransportOptions{WriteTimeout: h.md.writeTimeout})
 
 	return nil
 }

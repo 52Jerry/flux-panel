@@ -114,7 +114,7 @@ func (h *relayHandler) handleForward(ctx context.Context, conn net.Conn, network
 
 	t := time.Now()
 	log.Debugf("%s <-> %s", conn.RemoteAddr(), target.Addr)
-	xnet.TransportWithIdleTimeout(conn, cc, int(h.md.idleTimeout.Seconds()))
+	xnet.TransportWithOptions(conn, cc, xnet.TransportOptions{WriteTimeout: h.md.writeTimeout, IdleTimeout: h.md.idleTimeout})
 	log.WithFields(map[string]any{
 		"duration": time.Since(t),
 	}).Debugf("%s >-< %s", conn.RemoteAddr(), target.Addr)

@@ -1,0 +1,69 @@
+转发拥堵治理与链路观测
+
+本实现借鉴平滑发送、控制排队量和反馈观测，属于应用层整形与异常连接治理。
+它不实现或切换TCP BBR，不修改主机内核设置，不把TCP抽样交付率当链路容量自动调配额。
+
+写停滞处理
+
+普通forward local/remote的常规转发与relay数据路径，writeTimeout默认60秒。
+没有待写数据的健康空闲连接不触发；可见写进度刷新预算，主动限速等待不占网络写预算。
+TLS等封装流使用完整预算与Close回收，避免短deadline探测损坏协议；端点必须支持Close中断I/O。
+服务handler配置示例：
+  "handler": {"type":"tcp", "metadata":{"writeTimeout":"60s"}}
+接受duration字符串或秒数，显式0关闭，负数和非法值拒绝。建议显式写单位。
+relay connect/forward的idleTimeout仍默认300s，但双向任一活动都会保活；显式0关闭。
+relay entrypoint的idle保持原可选策略。旧Transport() API、HTTP/TLS专用sniffer等未迁移路径保留原策略。
+
+平滑限速与公平调度
+
+内置流量限速器默认100ms突发窗口、最多256KiB突发；单次授权最多32KiB，低速最小1B。
+同limiter ID的所有服务继续共享一个输入桶、一个输出桶，配额与原B/s单位不变。
+默认在同一共享配额内按用户进行字节公平调度，多开TCP/UDP连接不会复制用户份额。
+不同limiter ID仍是独立预算；这里没有自动设置节点物理出口总带宽。
+公平只安排有排队需求时的授权顺序，不在调度器里保存payload或执行网络I/O。
+令牌授权与实际下游写入有时间差，实际发包仍受操作系统、接收端和网络影响。
+UDP按整包累计额度后一次发送，避免小burst截断或静默丢包。
+
+节点GOST配置limiters数组中的例子：
+  {
+    "name":"shared-plan",
+    "limits":["$ 10MB 10MB"],
+    "metadata":{"traffic.burst":"100ms","traffic.fairness":"user"}
+  }
+速度沿用现有ParseBase2Bytes及面板速度换算。
+traffic.fairness支持none、service、user、user-tunnel；默认user。
+Flux的forwardId_userId_userTunnelId_protocol名称先验证数字ID和tcp/udp/tls协议，再分组。
+非Flux名称回退完整service名；none使用单一共享FIFO组；外部HTTP/gRPC限速插件保持其提供方语义。
+每个方向最多4096个待授权请求、1024个活跃组，每公平组128个请求；满队列返回明确错误。
+取消/Close摘除请求，空组删除，空闲runner在50ms后退出。缓存每方向最多4096条。
+
+链路观测
+
+新Go节点在状态报文中增加可选congestion，节点卡片折叠区“转发链路”展示这些信息。
+旧节点、无样本或不支持的字段显示暂无数据，不伪装健康0。无需数据库迁移。
+应用停滞阈值1s；计数属于节点进程生命周期，活动最长等待最多约1s观测滞后。
+累计转交字节是底层Write返回的字节，不表示接收方已收到。
+
+TCP采样只读TCP_INFO/TCP_CONGESTION，不发主动探测包，不切换算法。
+最多跟踪512个活跃TCP端点，每次轮转采64个；传输结束即释放引用，覆盖不完整时标记sampling_limited。
+RTT单位ms；交付率从内核B/s乘8转bits/s，是样本socket交付率之和，不是可用带宽。
+重传为本次活跃样本各自连接生命周期累计，不可直接当丢包率或相邻轮次差分。
+待发字节只覆盖样本尚未发出的内核队列；不会覆盖运营商或所有上游队列。
+保留内核实际返回长度，旧内核缺失字段用null。非Linux、用户态WG或无socket透传的封装不提供内核指标。
+BBR/CUBIC计数说明当前样本socket的实际算法，不表示全部连接、BBR版本或整条链路。
+
+验证与上线
+
+先升级Go节点才能产生指标；新前端兼容旧节点。不要直接用采样速率自动提高用户配额。
+普通内核TCP可另行做BBR/fq对照；WG用户态内层TCP和QUIC不因宿主机TCP设置直接切换算法。
+只读检查：uname -r；sysctl net.ipv4.tcp_available_congestion_control；ss -tin；tc -s qdisc show。
+应对同一路径记录吞吐、满载RTT、重传及当前算法，再决定内核调优。
+Go x模块：go test ./... -count=1 -timeout=120s；根模块：go test ./... -count=1 -timeout=90s。
+前端：npm run test:congestion；npm run test:node-config；npm run test:resources；npm run build。
+Java使用JDK21运行SystemInfoCongestionTest及已有单元回归。
+Windows本地测试与Linux交叉编译不替代真实Linux链路压力测试。
+
+原理参考：
+https://datatracker.ietf.org/doc/html/draft-ietf-ccwg-bbr-06
+https://github.com/google/bbr/blob/master/Documentation/bbr-quick-start.md
+https://docs.kernel.org/networking/ip-sysctl.html

@@ -5,6 +5,7 @@ import (
 	"context"
 	"io"
 	"net"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -35,9 +36,16 @@ type options struct {
 	httpLoader  loader.Loader
 	period      time.Duration
 	logger      logger.Logger
+	burst       time.Duration
+	fairness    string
 }
 
 type Option func(opts *options)
+
+func BurstOption(burst time.Duration) Option { return func(opts *options) { opts.burst = burst } }
+func FairnessOption(mode string) Option {
+	return func(opts *options) { opts.fairness = strings.ToLower(strings.TrimSpace(mode)) }
+}
 
 func LimitsOption(limits ...string) Option {
 	return func(opts *options) {
@@ -91,13 +99,18 @@ type trafficLimiter struct {
 	outLimits  *cache.Cache
 	mu         sync.RWMutex
 	cancelFunc context.CancelFunc
+	ctx        context.Context
+	closeOnce  sync.Once
 	options    options
 }
 
 func NewTrafficLimiter(opts ...Option) traffic.TrafficLimiter {
-	var options options
+	options := options{burst: DefaultBurst, fairness: "user", logger: logger.Default()}
 	for _, opt := range opts {
 		opt(&options)
+	}
+	if options.logger == nil {
+		options.logger = logger.LoggerGroup()
 	}
 
 	ctx, cancel := context.WithCancel(context.TODO())
@@ -109,6 +122,7 @@ func NewTrafficLimiter(opts ...Option) traffic.TrafficLimiter {
 		outLimits:      cache.New(defaultExpiration, cleanupInterval),
 		options:        options,
 		cancelFunc:     cancel,
+		ctx:            ctx,
 	}
 
 	if err := lim.reload(ctx); err != nil {
@@ -131,7 +145,7 @@ func (l *trafficLimiter) In(ctx context.Context, key string, opts ...limiter.Opt
 	switch options.Scope {
 	case limiter.ScopeService:
 		if lim, ok := l.inLimits.Get(ServiceLimitKey); ok && lim != nil {
-			return lim.(traffic.Limiter)
+			return l.serviceLimiter(lim.(traffic.Limiter), options.Service)
 		}
 		return nil
 
@@ -210,7 +224,7 @@ func (l *trafficLimiter) Out(ctx context.Context, key string, opts ...limiter.Op
 	switch options.Scope {
 	case limiter.ScopeService:
 		if lim, ok := l.outLimits.Get(ServiceLimitKey); ok && lim != nil {
-			return lim.(traffic.Limiter)
+			return l.serviceLimiter(lim.(traffic.Limiter), options.Service)
 		}
 		return nil
 
@@ -317,7 +331,7 @@ func (l *trafficLimiter) reload(ctx context.Context) error {
 			}
 		} else {
 			if value.in > 0 {
-				l.inLimits.Set(ServiceLimitKey, NewLimiter(value.in), cache.NoExpiration)
+				l.inLimits.Set(ServiceLimitKey, newLimiter(value.in, l.options.burst, l.ctx), cache.NoExpiration)
 			}
 		}
 
@@ -330,7 +344,7 @@ func (l *trafficLimiter) reload(ctx context.Context) error {
 			}
 		} else {
 			if value.out > 0 {
-				l.outLimits.Set(ServiceLimitKey, NewLimiter(value.out), cache.NoExpiration)
+				l.outLimits.Set(ServiceLimitKey, newLimiter(value.out, l.options.burst, l.ctx), cache.NoExpiration)
 			}
 		}
 		delete(values, ServiceLimitKey)
@@ -344,7 +358,7 @@ func (l *trafficLimiter) reload(ctx context.Context) error {
 		if v, _ := l.generators.Load(ConnLimitKey); v != nil {
 			in, out = v.(*limitGenerator).in, v.(*limitGenerator).out
 		}
-		l.generators.Store(ConnLimitKey, newLimitGenerator(value.in, value.out))
+		l.generators.Store(ConnLimitKey, newLimitGenerator(value.in, value.out, l.options.burst, l.ctx))
 
 		if value.in <= 0 {
 			l.connInLimits.Flush()
@@ -352,7 +366,7 @@ func (l *trafficLimiter) reload(ctx context.Context) error {
 			if in != value.in {
 				for _, item := range l.connInLimits.Items() {
 					if v := item.Object; v != nil {
-						v.(traffic.Limiter).Set(in)
+						v.(traffic.Limiter).Set(value.in)
 					}
 				}
 			}
@@ -364,7 +378,7 @@ func (l *trafficLimiter) reload(ctx context.Context) error {
 			if out != value.out {
 				for _, item := range l.connOutLimits.Items() {
 					if v := item.Object; v != nil {
-						v.(traffic.Limiter).Set(out)
+						v.(traffic.Limiter).Set(value.out)
 					}
 				}
 			}
@@ -386,7 +400,7 @@ func (l *trafficLimiter) reload(ctx context.Context) error {
 			if _, ipNet, _ := net.ParseCIDR(key); ipNet != nil {
 				cidrGenerators.Insert(&cidrLimitEntry{
 					ipNet:     *ipNet,
-					generator: newLimitGenerator(value.in, value.out),
+					generator: newLimitGenerator(value.in, value.out, l.options.burst, l.ctx),
 				})
 				continue
 			}
@@ -401,7 +415,7 @@ func (l *trafficLimiter) reload(ctx context.Context) error {
 				delete(inLimits, key)
 			} else {
 				if value.in > 0 {
-					l.inLimits.Set(key, NewLimiter(value.in), cache.NoExpiration)
+					l.inLimits.Set(key, newLimiter(value.in, l.options.burst, l.ctx), cache.NoExpiration)
 				}
 			}
 
@@ -415,7 +429,7 @@ func (l *trafficLimiter) reload(ctx context.Context) error {
 				delete(outLimits, key)
 			} else {
 				if value.out > 0 {
-					l.outLimits.Set(key, NewLimiter(value.out), cache.NoExpiration)
+					l.outLimits.Set(key, newLimiter(value.out, l.options.burst, l.ctx), cache.NoExpiration)
 				}
 			}
 		}
@@ -606,14 +620,60 @@ func (l *trafficLimiter) parseLimit(s string) (key string, in, out int) {
 }
 
 func (l *trafficLimiter) Close() error {
-	l.cancelFunc()
-	if l.options.fileLoader != nil {
-		l.options.fileLoader.Close()
-	}
-	if l.options.redisLoader != nil {
-		l.options.redisLoader.Close()
-	}
+	l.closeOnce.Do(func() {
+		l.cancelFunc()
+		l.connInLimits.Flush()
+		l.connOutLimits.Flush()
+		l.inLimits.Flush()
+		l.outLimits.Flush()
+		if l.options.fileLoader != nil {
+			l.options.fileLoader.Close()
+		}
+		if l.options.redisLoader != nil {
+			l.options.redisLoader.Close()
+		}
+		if l.options.httpLoader != nil {
+			l.options.httpLoader.Close()
+		}
+	})
 	return nil
+}
+
+func (l *trafficLimiter) serviceLimiter(lim traffic.Limiter, service string) traffic.Limiter {
+	if paced, ok := lim.(*llimiter); ok {
+		return paced.forGroup(fairnessKey(l.options.fairness, service))
+	}
+	return lim
+}
+
+// Flux services are forwardId_userId_userTunnelId_protocol. Validate all IDs
+// before grouping, so an unrelated service name cannot impersonate a user key.
+func fairnessKey(mode, service string) string {
+	if mode == "none" {
+		return ""
+	}
+	parts := strings.Split(service, "_")
+	flux := len(parts) == 4
+	if flux {
+		for _, id := range parts[:3] {
+			if _, err := strconv.ParseUint(id, 10, 64); err != nil {
+				flux = false
+				break
+			}
+		}
+		flux = flux && (parts[3] == "tcp" || parts[3] == "udp" || parts[3] == "tls")
+	}
+	if flux {
+		switch mode {
+		case "service":
+			return "service:" + strings.Join(parts[:3], "_")
+		case "user-tunnel":
+			return "user-tunnel:" + parts[1] + ":" + parts[2]
+		default:
+			return "user:" + parts[1]
+		}
+	}
+	return "service:" + service
 }
 
 type cidrLimitEntry struct {

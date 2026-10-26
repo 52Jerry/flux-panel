@@ -310,13 +310,14 @@ type RecorderObject struct {
 }
 
 type LimiterConfig struct {
-	Name   string        `json:"name"`
-	Limits []string      `yaml:",omitempty" json:"limits,omitempty"`
-	Reload time.Duration `yaml:",omitempty" json:"reload,omitempty"`
-	File   *FileLoader   `yaml:",omitempty" json:"file,omitempty"`
-	Redis  *RedisLoader  `yaml:",omitempty" json:"redis,omitempty"`
-	HTTP   *HTTPLoader   `yaml:"http,omitempty" json:"http,omitempty"`
-	Plugin *PluginConfig `yaml:",omitempty" json:"plugin,omitempty"`
+	Name     string         `json:"name"`
+	Limits   []string       `yaml:",omitempty" json:"limits,omitempty"`
+	Reload   time.Duration  `yaml:",omitempty" json:"reload,omitempty"`
+	File     *FileLoader    `yaml:",omitempty" json:"file,omitempty"`
+	Redis    *RedisLoader   `yaml:",omitempty" json:"redis,omitempty"`
+	HTTP     *HTTPLoader    `yaml:"http,omitempty" json:"http,omitempty"`
+	Plugin   *PluginConfig  `yaml:",omitempty" json:"plugin,omitempty"`
+	Metadata map[string]any `yaml:",omitempty" json:"metadata,omitempty"`
 }
 
 type ObserverConfig struct {

@@ -7,6 +7,7 @@ import (
 
 	limiter "github.com/go-gost/core/limiter/conn"
 	"github.com/go-gost/core/metadata"
+	xnet "github.com/go-gost/x/internal/net"
 )
 
 var (
@@ -37,6 +38,12 @@ func (c *serverConn) SyscallConn() (rc syscall.RawConn, err error) {
 	err = errUnsupport
 	return
 }
+
+func (c *serverConn) WriteWithOptions(p []byte, opts xnet.WriteOptions) (int, error) {
+	return xnet.WriteWithOptions(c.Conn, p, opts)
+}
+
+func (c *serverConn) NetConn() net.Conn { return c.Conn }
 
 func (c *serverConn) Close() error {
 	c.limiter.Allow(-1)

@@ -8,6 +8,7 @@ import (
 
 	"github.com/go-gost/core/bypass"
 	mdata "github.com/go-gost/core/metadata"
+	xnet "github.com/go-gost/x/internal/net"
 	"github.com/go-gost/x/internal/util/mux"
 	mdutil "github.com/go-gost/x/metadata/util"
 	"github.com/go-gost/x/registry"
@@ -15,11 +16,12 @@ import (
 
 type metadata struct {
 	readTimeout  time.Duration
-	idleTimeout time.Duration // data transfer idle timeout (seconds)
-	enableBind  bool
-	noDelay     bool
-	hash        string
-	muxCfg      *mux.Config
+	writeTimeout time.Duration
+	idleTimeout  time.Duration // data transfer idle timeout (seconds)
+	enableBind   bool
+	noDelay      bool
+	hash         string
+	muxCfg       *mux.Config
 
 	observerPeriod       time.Duration
 	observerResetTraffic bool
@@ -39,6 +41,10 @@ type metadata struct {
 }
 
 func (h *relayHandler) parseMetadata(md mdata.Metadata) (err error) {
+	h.md.writeTimeout, err = xnet.TransportTimeout(md, "writeTimeout", xnet.DefaultWriteTimeout)
+	if err != nil {
+		return err
+	}
 	h.md.readTimeout = mdutil.GetDuration(md, "readTimeout")
 	if h.md.readTimeout <= 0 {
 		h.md.readTimeout = 15 * time.Second
@@ -47,9 +53,9 @@ func (h *relayHandler) parseMetadata(md mdata.Metadata) (err error) {
 	// idleTimeout: close relay connections after this many seconds of
 	// inactivity during data transfer. Default 300s (5 min) to catch
 	// dead residential SOCKS proxies without killing long-lived tunnels.
-	h.md.idleTimeout = mdutil.GetDuration(md, "idleTimeout")
-	if h.md.idleTimeout <= 0 {
-		h.md.idleTimeout = 300 * time.Second
+	h.md.idleTimeout, err = xnet.TransportTimeout(md, "idleTimeout", 300*time.Second)
+	if err != nil {
+		return err
 	}
 
 	h.md.enableBind = mdutil.GetBool(md, "bind")

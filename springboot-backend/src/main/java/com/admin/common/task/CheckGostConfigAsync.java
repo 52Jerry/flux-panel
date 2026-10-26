@@ -3,23 +3,30 @@ package com.admin.common.task;
 import com.admin.common.dto.*;
 import com.admin.common.lang.R;
 import com.admin.common.utils.GostUtil;
+import com.admin.common.utils.BoundedKeyedExecutor;
+import com.admin.common.utils.WebSocketServer;
 import com.admin.entity.*;
 import com.admin.service.*;
 import com.alibaba.fastjson.JSONObject;
 import com.baomidou.mybatisplus.core.conditions.query.QueryWrapper;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.context.annotation.Lazy;
-import org.springframework.scheduling.annotation.Async;
 import org.springframework.stereotype.Service;
 
 import javax.annotation.Resource;
+import javax.annotation.PreDestroy;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
+import java.util.concurrent.TimeUnit;
 
 @Slf4j
 @Service
 public class CheckGostConfigAsync {
+
+    private final BoundedKeyedExecutor cleanupExecutor = new BoundedKeyedExecutor("node-cleanup", 4, 64,
+            error -> log.error("节点配置清理失败", error));
 
     @Resource
     private NodeService nodeService;
@@ -41,26 +48,38 @@ public class CheckGostConfigAsync {
     /**
      * 清理孤立的Gost配置项
      */
-    @Async
     public void cleanNodeConfigs(String node_id, GostConfigDto gostConfig) {
-        System.out.println(JSONObject.toJSONString(gostConfig));
+        if (node_id == null || gostConfig == null) return;
+        if (!cleanupExecutor.submit(node_id, () -> cleanConfigs(node_id, gostConfig))) {
+            log.warn("节点配置清理队列已满，节点 {} 将在下次配置上报时重试", node_id);
+        }
+    }
+
+    private void cleanConfigs(String node_id, GostConfigDto gostConfig) {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(15);
         Node node = nodeService.getById(node_id);
         if (node != null) {
-            cleanOrphanedServices(gostConfig, node);
-            cleanOrphanedChains(gostConfig, node);
-            cleanOrphanedLimiters(gostConfig, node);
+            cleanOrphanedServices(gostConfig, node, deadline);
+            cleanOrphanedChains(gostConfig, node, deadline);
+            cleanOrphanedLimiters(gostConfig, node, deadline);
         }
+    }
+
+    @PreDestroy
+    public void close() {
+        cleanupExecutor.close();
     }
 
     /**
      * 清理孤立的服务
      */
-    private void cleanOrphanedServices(GostConfigDto gostConfig, Node node) {
+    private void cleanOrphanedServices(GostConfigDto gostConfig, Node node, long deadline) {
         if (gostConfig.getServices() == null) {
             return;
         }
 
         for (ConfigItem service : gostConfig.getServices()) {
+            if (System.nanoTime() >= deadline || Thread.currentThread().isInterrupted()) return;
             safeExecute(() -> {
 
                 if (!Objects.equals(service.getName(), "web_api")){
@@ -75,8 +94,9 @@ public class CheckGostConfigAsync {
                             Forward forward = forwardService.getById(forwardId);
                             if (forward == null) {
                                 log.info("删除孤立的服务: {} (节点: {})", service.getName(), node.getId());
-                                GostDto gostDto = GostUtil.DeleteService(node.getId(), forwardId + "_" + userId + "_" + userTunnelId);
-                                System.out.println(gostDto);
+                                String name = forwardId + "_" + userId + "_" + userTunnelId;
+                                sendCleanup(node.getId(), Map.of("services", List.of(name + "_tcp", name + "_udp")),
+                                        "DeleteService", deadline);
                             }
                         }
 
@@ -85,7 +105,8 @@ public class CheckGostConfigAsync {
                             Forward forward = forwardService.getById(forwardId);
                             if (forward == null) {
                                 log.info("删除孤立的服务: {} (节点: {})", service.getName(), node.getId());
-                                GostUtil.DeleteRemoteService(node.getId(), forwardId+"_"+userId+"_"+userTunnelId);
+                                sendCleanup(node.getId(), Map.of("services", List.of(service.getName())),
+                                        "DeleteService", deadline);
                             }
                         }
 
@@ -101,13 +122,14 @@ public class CheckGostConfigAsync {
     /**
      * 清理孤立的链
      */
-    private void cleanOrphanedChains(GostConfigDto gostConfig, Node node) {
+    private void cleanOrphanedChains(GostConfigDto gostConfig, Node node, long deadline) {
         if (gostConfig.getChains() == null) {
             return;
         }
         
 
         for (ConfigItem chain : gostConfig.getChains()) {
+            if (System.nanoTime() >= deadline || Thread.currentThread().isInterrupted()) return;
             safeExecute(() -> {
                 String[] serviceIds = parseServiceName(chain.getName());
                 if (serviceIds.length == 4) {
@@ -120,7 +142,7 @@ public class CheckGostConfigAsync {
                         Forward forward = forwardService.getById(forwardId);
                         if (forward == null) {
                             log.info("删除孤立的链: {} (节点: {})", chain.getName(), node.getId());
-                            GostUtil.DeleteChains(node.getId(), forwardId+"_"+userId+"_"+userTunnelId);
+                            sendCleanup(node.getId(), Map.of("chain", chain.getName()), "DeleteChains", deadline);
                         }
                     }
                 }
@@ -131,20 +153,30 @@ public class CheckGostConfigAsync {
     /**
      * 清理孤立的限流器
      */
-    private void cleanOrphanedLimiters(GostConfigDto gostConfig, Node node) {
+    private void cleanOrphanedLimiters(GostConfigDto gostConfig, Node node, long deadline) {
         if (gostConfig.getLimiters() == null) {
             return;
         }
         
 
         for (ConfigItem limiter : gostConfig.getLimiters()) {
+            if (System.nanoTime() >= deadline || Thread.currentThread().isInterrupted()) return;
             safeExecute(() -> {
                 SpeedLimit speedLimit = speedLimitService.getById(limiter.getName());
                 if (speedLimit == null) {
                     log.info("删除孤立的限流器: {} (节点: {})", limiter.getName(), node.getId());
-                    GostUtil.DeleteLimiters(node.getId(), Long.parseLong(limiter.getName()));
+                    sendCleanup(node.getId(), Map.of("limiter", limiter.getName()), "DeleteLimiters", deadline);
                 }
             }, "清理限流器 " + limiter.getName());
+        }
+    }
+
+    private void sendCleanup(Long nodeId, Object data, String type, long deadline) {
+        long remaining = TimeUnit.NANOSECONDS.toMillis(deadline - System.nanoTime());
+        if (remaining <= 0 || Thread.currentThread().isInterrupted()) return;
+        GostDto response = WebSocketServer.send_msg(nodeId, data, type, Math.min(10000, remaining));
+        if (!"OK".equals(response.getMsg())) {
+            log.warn("清理节点 {} 的 {} 失败: {}", nodeId, type, response.getMsg());
         }
     }
 

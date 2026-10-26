@@ -3,6 +3,14 @@
 Run configuration tests with `npm run test:node-config` and compile with
 `npm run build`.
 
+Run `npm run test:resources` for HTTP 401 settlement, CAPTCHA refresh/abort/
+timeout and stale-callback handling, and bulk-import batching/pagination.
+These tests use the actual vendored CAPTCHA renderer with a mocked XHR; they
+never contact a backend. The renderer's `createCaptcha` has a small compatibility
+hook that returns/catches the request Promise and checks the lifecycle sequence.
+Keep that hook when updating `tac.min.js`; ownership and request handling live in
+`src/utils/captcha-lifecycle.ts`.
+
 For browser tests, start Vite on port 3067, then run `npm run test:node-page`.
 The browser test intercepts all API requests and uses synthetic authentication;
 it does not read or update production nodes.

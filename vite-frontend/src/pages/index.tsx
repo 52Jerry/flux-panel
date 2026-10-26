@@ -13,6 +13,7 @@ import { login, LoginData, checkCaptcha } from "@/api";
 import "@/utils/tac.css";
 import "@/utils/tac.min.js";
 import bgImage from "@/images/bg.jpg";
+import { manageCaptcha } from '@/utils/captcha-lifecycle';
 
 
 interface LoginForm {
@@ -52,11 +53,17 @@ export default function IndexPage() {
   const [showCaptcha, setShowCaptcha] = useState(false);
   const navigate = useNavigate();
   const tacInstanceRef = useRef<any>(null);
+  const captchaInitTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const mountedRef = useRef(false);
   const captchaContainerRef = useRef<HTMLDivElement>(null);
   const [isWebView, setIsWebView] = useState(false);
   // 清理验证码实例
   useEffect(() => {
+    mountedRef.current = true;
     return () => {
+      mountedRef.current = false;
+      if (captchaInitTimerRef.current !== null) clearTimeout(captchaInitTimerRef.current);
+      captchaInitTimerRef.current = null;
       if (tacInstanceRef.current) {
         tacInstanceRef.current.destroyWindow();
         tacInstanceRef.current = null;
@@ -97,7 +104,7 @@ export default function IndexPage() {
 
   // 初始化验证码
   const initCaptcha = async () => {
-    if (!window.TAC || !captchaContainerRef.current) {
+    if (!mountedRef.current || !window.TAC || !captchaContainerRef.current) {
       return;
     }
 
@@ -118,11 +125,10 @@ export default function IndexPage() {
         validSuccess: (res: any, _: any, tac: any) => {
           
 
-          form.captchaId = res.data.validToken
-
           setShowCaptcha(false);
           tac.destroyWindow();
-          performLogin();
+          tacInstanceRef.current = null;
+          performLogin(res.data.validToken);
         },
         validFail: (_: any, _captcha: any, tac: any) => {
           tac.reloadCaptcha();
@@ -130,6 +136,7 @@ export default function IndexPage() {
         btnCloseFun: (_event: any, tac: any) => {
           setShowCaptcha(false);
           tac.destroyWindow();
+          tacInstanceRef.current = null;
           setLoading(false);
         },
         btnRefreshFun: (_event: any, tac: any) => {
@@ -152,10 +159,18 @@ export default function IndexPage() {
         moveTrackMaskBorderColor: trackColor
       };
 
-      tacInstanceRef.current = new window.TAC(config, style);
+      tacInstanceRef.current = manageCaptcha(new window.TAC(config, style), error => {
+        tacInstanceRef.current = null;
+        if (!mountedRef.current) return;
+        toast.error(error.message || '验证码加载失败，请重试');
+        setShowCaptcha(false);
+        setLoading(false);
+      });
       tacInstanceRef.current.init();
 
     } catch (error) {
+      tacInstanceRef.current?.destroyWindow();
+      tacInstanceRef.current = null;
       console.error('初始化验证码失败:', error);
       toast.error('验证码初始化失败，请刷新页面重试');
       setShowCaptcha(false);
@@ -164,17 +179,18 @@ export default function IndexPage() {
   };
 
   // 执行登录请求
-  const performLogin = async () => {
+  const performLogin = async (captchaId = form.captchaId) => {
 
 
     try {
       const loginData: LoginData = {
         username: form.username.trim(),
         password: form.password,
-        captchaId: form.captchaId,
+        captchaId,
       };
 
       const response = await login(loginData);
+      if (!mountedRef.current) return;
       
       if (response.code !== 0) {
         toast.error(response.msg || "登录失败");
@@ -203,10 +219,11 @@ export default function IndexPage() {
       navigate("/dashboard");
 
     } catch (error) {
+      if (!mountedRef.current) return;
       console.error('登录错误:', error);
       toast.error("网络错误，请稍后重试");
     } finally {
-      setLoading(false);
+      if (mountedRef.current) setLoading(false);
     }
   };
 
@@ -218,6 +235,7 @@ export default function IndexPage() {
     try {
       // 先检查是否需要验证码
       const checkResponse = await checkCaptcha();
+      if (!mountedRef.current) return;
       
       if (checkResponse.code !== 0) {
         toast.error("检查验证码状态失败，请重试" + checkResponse.msg);
@@ -233,11 +251,13 @@ export default function IndexPage() {
         // 需要验证码，显示验证码弹层
         setShowCaptcha(true);
         // 延时初始化验证码，确保DOM已渲染
-        setTimeout(() => {
+        captchaInitTimerRef.current = setTimeout(() => {
+          captchaInitTimerRef.current = null;
           initCaptcha();
         }, 100);
       }
     } catch (error) {
+      if (!mountedRef.current) return;
       console.error('检查验证码状态错误:', error);
       toast.error("网络错误，请稍后重试" + error);
       setLoading(false);

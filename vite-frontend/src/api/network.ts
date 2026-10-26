@@ -82,6 +82,7 @@ const Network = {
         .then(function(response: AxiosResponse<ApiResponse<T>>) {
           // 检查是否token失效
           if (isTokenExpired(response.data)) {
+            resolve(response.data);
             handleTokenExpired();
             return;
           }
@@ -92,6 +93,7 @@ const Network = {
            
            // 检查是否是401错误（token失效）
            if (error.response && error.response.status === 401) {
+             resolve({ code: 401, msg: '登录状态已失效，请重新登录', data: null as T });
              handleTokenExpired();
              return;
            }
@@ -119,6 +121,7 @@ const Network = {
         .then(function(response: AxiosResponse<ApiResponse<T>>) {
           // 检查是否token失效
           if (isTokenExpired(response.data)) {
+            resolve(response.data);
             handleTokenExpired();
             return;
           }
@@ -129,6 +132,7 @@ const Network = {
            
            // 检查是否是401错误（token失效）
            if (error.response && error.response.status === 401) {
+             resolve({ code: 401, msg: '登录状态已失效，请重新登录', data: null as T });
              handleTokenExpired();
              return;
            }
@@ -139,4 +143,4 @@ const Network = {
   }
 };
 
-export default Network; 
+export default Network;

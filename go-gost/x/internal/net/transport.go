@@ -52,10 +52,8 @@ func Transport(rw1, rw2 io.ReadWriter) error {
 	return err
 }
 
-// TransportWithIdleTimeout is like Transport but applies a per-read idle
-// deadline. If no data arrives on either connection within idleTimeout
-// seconds, the blocked Read() returns a deadline-exceeded error which
-// triggers connection cleanup in Transport.
+// TransportWithIdleTimeout bounds both reads and writes. A peer that stops
+// consuming data must not leave both copy loops blocked in Write forever.
 func TransportWithIdleTimeout(rw1, rw2 io.ReadWriter, idleTimeout int) error {
 	if idleTimeout <= 0 {
 		return Transport(rw1, rw2)
@@ -89,6 +87,10 @@ func (w *idleDeadlineConn) Read(p []byte) (int, error) {
 }
 
 func (w *idleDeadlineConn) Write(p []byte) (int, error) {
+	if c, ok := w.rw.(interface{ SetWriteDeadline(time.Time) error }); ok {
+		_ = c.SetWriteDeadline(time.Now().Add(w.timeout))
+		defer c.SetWriteDeadline(time.Time{})
+	}
 	return w.rw.Write(p)
 }
 

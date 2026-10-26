@@ -1,4 +1,7 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
+import { Pagination } from "@heroui/pagination";
+import { runForwardImport, importResultPage, IMPORT_PAGE_SIZE } from "@/utils/forward-import";
+import type { ForwardImportProgress } from "@/utils/forward-import";
 import { Card, CardBody, CardHeader } from "@heroui/card";
 import { Button } from "@heroui/button";
 import { Input } from "@heroui/input";
@@ -177,12 +180,11 @@ export default function ForwardPage() {
   const [importData, setImportData] = useState('');
   const [importLoading, setImportLoading] = useState(false);
   const [selectedTunnelForImport, setSelectedTunnelForImport] = useState<number | null>(null);
-  const [importResults, setImportResults] = useState<Array<{
-    line: string;
-    success: boolean;
-    message: string;
-    forwardName?: string;
-  }>>([]);
+  const [importProgress, setImportProgress] = useState<ForwardImportProgress>({ results: [], total: 0, success: 0 });
+  const [importPage, setImportPage] = useState(1);
+  const importResults = importResultPage(importProgress, importPage);
+  const importRunningRef = useRef(false);
+  const mountedRef = useRef(false);
   
   // 表单状态
   const [form, setForm] = useState<ForwardForm>({
@@ -199,7 +201,9 @@ export default function ForwardPage() {
   const [selectedTunnel, setSelectedTunnel] = useState<Tunnel | null>(null);
 
   useEffect(() => {
+    mountedRef.current = true;
     loadData();
+    return () => { mountedRef.current = false; };
   }, []);
 
   // 切换显示模式并保存到localStorage
@@ -869,125 +873,47 @@ export default function ForwardPage() {
   // 导入转发数据
   const handleImport = () => {
     setImportData('');
-    setImportResults([]);
+    setImportProgress({ results: [], total: 0, success: 0 });
+    setImportPage(1);
     setSelectedTunnelForImport(null);
     setImportModalOpen(true);
   };
 
   // 执行导入
   const executeImport = async () => {
+    if (importRunningRef.current) return;
     if (!importData.trim()) {
       toast.error('请输入要导入的数据');
       return;
     }
-
     if (!selectedTunnelForImport) {
       toast.error('请选择要导入的隧道');
       return;
     }
-
+    importRunningRef.current = true;
     setImportLoading(true);
-    setImportResults([]); // 清空之前的结果
-
+    setImportProgress({ results: [], total: 0, success: 0 });
+    setImportPage(1);
     try {
-      const lines = importData.trim().split('\n').filter(line => line.trim());
-      
-      for (let i = 0; i < lines.length; i++) {
-        const line = lines[i].trim();
-        const parts = line.split('|');
-        
-        if (parts.length < 2) {
-          setImportResults(prev => [{
-            line,
-            success: false,
-            message: '格式错误：需要至少包含目标地址和转发名称'
-          }, ...prev]);
-          continue;
-        }
-
-        const [remoteAddr, name, inPort] = parts;
-        
-        if (!remoteAddr.trim() || !name.trim()) {
-          setImportResults(prev => [{
-            line,
-            success: false,
-            message: '目标地址和转发名称不能为空'
-          }, ...prev]);
-          continue;
-        }
-
-        // 验证远程地址格式 - 支持单个地址或多个地址用逗号分隔
-        const addresses = remoteAddr.trim().split(',');
-        const addressPattern = /^[^:]+:\d+$/;
-        const isValidFormat = addresses.every(addr => addressPattern.test(addr.trim()));
-        
-        if (!isValidFormat) {
-          setImportResults(prev => [{
-            line,
-            success: false,
-            message: '目标地址格式错误，应为 地址:端口 格式，多个地址用逗号分隔'
-          }, ...prev]);
-          continue;
-        }
-
-        try {
-          // 处理入口端口
-          let portNumber: number | null = null;
-          if (inPort && inPort.trim()) {
-            const port = parseInt(inPort.trim());
-            if (isNaN(port) || port < 1 || port > 65535) {
-              setImportResults(prev => [{
-                line,
-                success: false,
-                message: '入口端口格式错误，应为1-65535之间的数字'
-              }, ...prev]);
-              continue;
-            }
-            portNumber = port;
-          }
-
-          // 调用创建转发接口
-          const response = await createForward({
-            name: name.trim(),
-            tunnelId: selectedTunnelForImport, // 使用用户选择的隧道
-            inPort: portNumber, // 使用指定端口或自动分配
-            remoteAddr: remoteAddr.trim(),
-            strategy: 'fifo'
-          });
-
-          if (response.code === 0) {
-            setImportResults(prev => [{
-              line,
-              success: true,
-              message: '创建成功',
-              forwardName: name.trim()
-            }, ...prev]);
-          } else {
-            setImportResults(prev => [{
-              line,
-              success: false,
-              message: response.msg || '创建失败'
-            }, ...prev]);
-          }
-        } catch (error) {
-          setImportResults(prev => [{
-            line,
-            success: false,
-            message: '网络错误，创建失败'
-          }, ...prev]);
-        }
+      const completed = await runForwardImport({
+        text: importData,
+        tunnelId: selectedTunnelForImport,
+        createForward,
+        onProgress: setImportProgress,
+        shouldStop: () => !mountedRef.current,
+      });
+      if (completed) {
+        toast.success('导入执行完成');
+        await loadData(false);
       }
-      
-      
-      toast.success(`导入执行完成`);
-      
-      // 导入完成后刷新转发列表
-      await loadData(false);
     } catch (error) {
-      console.error('导入失败:', error);
-      toast.error('导入过程中发生错误');
+      if (mountedRef.current) {
+        console.error('导入失败:', error);
+        toast.error('导入过程中发生错误');
+      }
     } finally {
-      setImportLoading(false);
+      importRunningRef.current = false;
+      if (mountedRef.current) setImportLoading(false);
     }
   };
 
@@ -1941,8 +1867,8 @@ export default function ForwardPage() {
                       <h3 className="text-base font-semibold">导入结果</h3>
                       <div className="flex items-center gap-2">
                         <span className="text-xs text-default-500">
-                          成功：{importResults.filter(r => r.success).length} / 
-                          总计：{importResults.length}
+                          成功：{importProgress.success} /
+                          总计：{importProgress.total}
                         </span>
                       </div>
                     </div>
@@ -1990,6 +1916,16 @@ export default function ForwardPage() {
                         </div>
                       ))}
                     </div>
+                    {importProgress.total > IMPORT_PAGE_SIZE && (
+                      <Pagination
+                        aria-label="导入结果分页"
+                        className="mt-3"
+                        size="sm"
+                        page={importPage}
+                        total={Math.ceil(importProgress.total / IMPORT_PAGE_SIZE)}
+                        onChange={setImportPage}
+                      />
+                    )}
                   </div>
                 )}
               </div>
@@ -2005,7 +1941,7 @@ export default function ForwardPage() {
                 color="warning" 
                 onPress={executeImport}
                 isLoading={importLoading}
-                isDisabled={!importData.trim() || !selectedTunnelForImport}
+                isDisabled={importLoading || !importData.trim() || !selectedTunnelForImport}
               >
                 开始导入
               </Button>

@@ -53,10 +53,10 @@ var needWrap = false
 
 // SetProtocolBlock sets protocol blocking switches and recomputes wrapper need
 func SetProtocolBlock(httpOn int, tlsOn int, socksOn int) {
-    isHttp = httpOn
-    isTls = tlsOn
-    isSocks = socksOn
-    needWrap = isTls+isSocks+isHttp > 0
+	isHttp = httpOn
+	isTls = tlsOn
+	isSocks = socksOn
+	needWrap = isTls+isSocks+isHttp > 0
 }
 
 type Option func(opts *options)
@@ -122,12 +122,20 @@ func LoggerOption(logger logger.Logger) Option {
 }
 
 type defaultService struct {
-	name     string
-	listener listener.Listener
-	handler  handler.Handler
-	status   *Status
-	options  options
-	done     chan struct{} // closed when Serve() exits
+	name      string
+	listener  listener.Listener
+	handler   handler.Handler
+	status    *Status
+	options   options
+	done      chan struct{} // closed when Serve() exits
+	ctx       context.Context
+	cancel    context.CancelFunc
+	mu        sync.Mutex
+	active    map[net.Conn]struct{}
+	started   bool
+	closed    bool
+	closeOnce sync.Once
+	closeErr  error
 }
 
 func NewService(name string, ln listener.Listener, h handler.Handler, opts ...Option) service.Service {
@@ -135,12 +143,19 @@ func NewService(name string, ln listener.Listener, h handler.Handler, opts ...Op
 	for _, opt := range opts {
 		opt(&options)
 	}
+	if options.logger == nil {
+		options.logger = logger.LoggerGroup()
+	}
+	ctx, cancel := context.WithCancel(context.Background())
 	s := &defaultService{
 		name:     name,
 		listener: ln,
 		handler:  h,
 		options:  options,
 		done:     make(chan struct{}),
+		ctx:      ctx,
+		cancel:   cancel,
+		active:   make(map[net.Conn]struct{}),
 		status: &Status{
 			createTime: time.Now(),
 			events:     make([]Event, 0, MaxEventSize),
@@ -159,7 +174,18 @@ func (s *defaultService) Addr() net.Addr {
 }
 
 func (s *defaultService) Serve() error {
+	s.mu.Lock()
+	if s.started || s.closed {
+		s.mu.Unlock()
+		return net.ErrClosed
+	}
+	s.started = true
+	s.mu.Unlock()
 	defer close(s.done)
+	var wg sync.WaitGroup
+	defer wg.Wait()
+	// Cancel observers and close active connections before waiting for workers.
+	defer s.stop()
 
 	s.execCmds("post-up", s.options.postUp)
 	s.setState(StateReady)
@@ -168,11 +194,14 @@ func (s *defaultService) Serve() error {
 		Message: fmt.Sprintf("service %s is listening on %s", s.name, s.listener.Addr()),
 	})
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := s.ctx
 
 	if s.status.Stats() != nil {
-		go s.observeStats(ctx)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			s.observeStats(ctx)
+		}()
 	}
 
 	if v := xmetrics.GetGauge(
@@ -182,13 +211,13 @@ func (s *defaultService) Serve() error {
 		defer v.Dec()
 	}
 
-	var wg sync.WaitGroup
-	defer wg.Wait()
-
 	var tempDelay time.Duration
 	for {
 		conn, e := s.listener.Accept()
 		if e != nil {
+			if ctx.Err() != nil {
+				return net.ErrClosed
+			}
 
 			// TODO: remove Temporary checking
 			if ne, ok := e.(net.Error); ok && ne.Temporary() {
@@ -204,7 +233,11 @@ func (s *defaultService) Serve() error {
 				s.setState(StateFailed)
 
 				s.options.logger.Warnf("accept: %v, retrying in %v", e, tempDelay)
-				time.Sleep(tempDelay)
+				select {
+				case <-time.After(tempDelay):
+				case <-ctx.Done():
+					return net.ErrClosed
+				}
 				continue
 			}
 			s.setState(StateClosed)
@@ -215,6 +248,15 @@ func (s *defaultService) Serve() error {
 
 			return e
 		}
+		s.mu.Lock()
+		if s.closed {
+			s.mu.Unlock()
+			conn.Close()
+			return net.ErrClosed
+		}
+		s.active[conn] = struct{}{}
+		s.mu.Unlock()
+		accepted := conn
 
 		if tempDelay > 0 {
 			tempDelay = 0
@@ -251,7 +293,7 @@ func (s *defaultService) Serve() error {
 		}
 		if s.options.admission != nil &&
 			!s.options.admission.Admit(ctx, clientAddr) {
-			conn.Close()
+			s.releaseConn(accepted)
 			log.Debugf("admission: %s is denied", clientAddr)
 			continue
 		}
@@ -260,6 +302,7 @@ func (s *defaultService) Serve() error {
 
 		go func() {
 			defer wg.Done()
+			defer s.releaseConn(accepted)
 
 			if v := xmetrics.GetCounter(xmetrics.MetricServiceRequestsCounter,
 				metrics.Labels{"service": s.name, "client": clientIP}); v != nil {
@@ -303,26 +346,52 @@ func (s *defaultService) Status() *Status {
 }
 
 func (s *defaultService) Close() error {
-	s.execCmds("pre-down", s.options.preDown)
-	defer s.execCmds("post-down", s.options.postDown)
-
-	if closer, ok := s.handler.(io.Closer); ok {
-		closer.Close()
-	}
-	err := s.listener.Close()
-
-	// Wait for the Serve() goroutine to fully exit so the listener socket
-	// and all resources are released before returning. This prevents the
-	// "old port not released" issue when reconfiguring services.
+	s.stop()
 	select {
 	case <-s.done:
 	case <-time.After(3 * time.Second):
 		s.options.logger.Warnf("service %s: Serve() did not exit within 3s after Close()", s.name)
 	}
-	return err
+	return s.closeErr
+}
+
+func (s *defaultService) releaseConn(conn net.Conn) {
+	conn.Close()
+	s.mu.Lock()
+	delete(s.active, conn)
+	s.mu.Unlock()
+}
+
+func (s *defaultService) stop() {
+	s.closeOnce.Do(func() {
+		s.mu.Lock()
+		s.closed = true
+		started := s.started
+		conns := make([]net.Conn, 0, len(s.active))
+		for conn := range s.active {
+			conns = append(conns, conn)
+		}
+		s.mu.Unlock()
+		s.cancel()
+		s.execCmds("pre-down", s.options.preDown)
+		s.closeErr = s.listener.Close()
+		for _, conn := range conns {
+			conn.Close()
+		}
+		if closer, ok := s.handler.(io.Closer); ok {
+			closer.Close()
+		}
+		s.setState(StateClosed)
+		s.execCmds("post-down", s.options.postDown)
+		if !started {
+			close(s.done)
+		}
+	})
 }
 
 func (s *defaultService) execCmds(phase string, cmds []string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
 	for _, cmd := range cmds {
 		cmd := strings.TrimSpace(cmd)
 		if cmd == "" {
@@ -330,14 +399,23 @@ func (s *defaultService) execCmds(phase string, cmds []string) {
 		}
 		s.options.logger.Info(cmd)
 
-		if err := exec.Command("/bin/sh", "-c", cmd).Run(); err != nil {
+		if ctx.Err() != nil {
+			break
+		}
+		if err := exec.CommandContext(ctx, "/bin/sh", "-c", cmd).Run(); err != nil {
 			s.options.logger.Warnf("[%s] %s: %v", phase, cmd, err)
 		}
 	}
 }
 
 func (s *defaultService) setState(state State) {
+	s.mu.Lock()
+	if s.closed && state != StateClosed {
+		s.mu.Unlock()
+		return
+	}
 	s.status.setState(state)
+	s.mu.Unlock()
 
 	msg := fmt.Sprintf("service %s is %s", s.name, state)
 	s.status.addEvent(Event{
@@ -346,7 +424,9 @@ func (s *defaultService) setState(state State) {
 	})
 
 	if obs := s.options.observer; obs != nil {
-		obs.Observe(context.Background(), []observer.Event{ServiceEvent{
+		ctx, cancel := context.WithTimeout(s.ctx, 3*time.Second)
+		defer cancel()
+		obs.Observe(ctx, []observer.Event{ServiceEvent{
 			Kind:    "service",
 			Service: s.name,
 			State:   state,

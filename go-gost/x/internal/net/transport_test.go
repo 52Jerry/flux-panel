@@ -97,3 +97,38 @@ func TestTransportIdleTimeoutClosesBothSides(t *testing.T) {
 		t.Fatal("idle transport did not release both sides")
 	}
 }
+
+func TestTransportIdleTimeoutInterruptsBothBlockedWrites(t *testing.T) {
+	client, inbound := net.Pipe()
+	outbound, upstream := net.Pipe()
+	defer client.Close()
+	defer inbound.Close()
+	defer outbound.Close()
+	defer upstream.Close()
+	done := make(chan error, 1)
+	go func() { done <- TransportWithIdleTimeout(inbound, outbound, 1) }()
+	// Each transport copy reads one payload, then both block trying to write
+	// to a peer which never reads. A read-only deadline cannot release this.
+	sent := make(chan error, 2)
+	for _, peer := range []net.Conn{client, upstream} {
+		go func(peer net.Conn) { _, err := peer.Write([]byte("payload")); sent <- err }(peer)
+	}
+	for i := 0; i < 2; i++ {
+		select {
+		case err := <-sent:
+			if err != nil {
+				t.Fatal(err)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("transport did not read both payloads")
+		}
+	}
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("expected write deadline error")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("both copy workers remained blocked in Write")
+	}
+}

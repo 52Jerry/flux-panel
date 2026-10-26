@@ -4,7 +4,8 @@ import com.admin.common.utils.AESCrypto;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
 
-import java.util.concurrent.ConcurrentHashMap;
+import java.util.LinkedHashMap;
+import java.util.Map;
 
 /**
  * 加密配置管理类
@@ -15,7 +16,8 @@ import java.util.concurrent.ConcurrentHashMap;
 public class EncryptionConfig {
     
     // 缓存加密器实例，避免重复创建
-    private static final ConcurrentHashMap<String, AESCrypto> CRYPTO_CACHE = new ConcurrentHashMap<>();
+    static final int MAX_CACHE_SIZE = 256;
+    private static final Map<String, AESCrypto> CRYPTO_CACHE = new LinkedHashMap<>(32, 0.75f, true);
     
     /**
      * 获取或创建AES加密器实例
@@ -23,11 +25,21 @@ public class EncryptionConfig {
      * @param secret 密钥字符串
      * @return AES加密器实例，如果创建失败返回null
      */
-    public static AESCrypto getOrCreateCrypto(String secret) {
+    public static synchronized AESCrypto getOrCreateCrypto(String secret) {
         if (secret == null || secret.isEmpty()) {
             return null;
         }
-        return CRYPTO_CACHE.computeIfAbsent(secret, AESCrypto::create);
+        AESCrypto crypto = CRYPTO_CACHE.get(secret);
+        if (crypto == null) {
+            crypto = AESCrypto.create(secret);
+            if (crypto != null) {
+                if (CRYPTO_CACHE.size() >= MAX_CACHE_SIZE) {
+                    CRYPTO_CACHE.remove(CRYPTO_CACHE.keySet().iterator().next());
+                }
+                CRYPTO_CACHE.put(secret, crypto);
+            }
+        }
+        return crypto;
     }
     
     /**
@@ -54,7 +66,7 @@ public class EncryptionConfig {
      * 
      * @param secret 要清理的密钥
      */
-    public static void clearCrypto(String secret) {
+    public static synchronized void clearCrypto(String secret) {
         if (secret != null) {
             CRYPTO_CACHE.remove(secret);
             log.info("已清理密钥对应的加密器实例");
@@ -64,7 +76,7 @@ public class EncryptionConfig {
     /**
      * 清理所有缓存的加密器实例
      */
-    public static void clearAllCrypto() {
+    public static synchronized void clearAllCrypto() {
         int size = CRYPTO_CACHE.size();
         CRYPTO_CACHE.clear();
         log.info("已清理所有加密器实例缓存，共清理 {} 个实例", size);
@@ -75,7 +87,7 @@ public class EncryptionConfig {
      * 
      * @return 缓存的加密器数量
      */
-    public static int getCacheSize() {
+    public static synchronized int getCacheSize() {
         return CRYPTO_CACHE.size();
     }
-} 
+}

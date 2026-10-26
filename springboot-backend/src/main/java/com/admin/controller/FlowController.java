@@ -3,10 +3,10 @@ package com.admin.controller;
 import com.admin.common.aop.LogAnnotation;
 import com.admin.common.dto.FlowDto;
 import com.admin.common.dto.GostConfigDto;
-import com.admin.common.lang.R;
 import com.admin.common.task.CheckGostConfigAsync;
+import com.admin.common.task.FlowLimitEnforcer;
 import com.admin.common.utils.AESCrypto;
-import com.admin.common.utils.GostUtil;
+import com.admin.config.EncryptionConfig;
 import com.admin.entity.*;
 import com.alibaba.fastjson.JSON;
 import com.alibaba.fastjson.JSONObject;
@@ -18,11 +18,10 @@ import lombok.extern.slf4j.Slf4j;
 import javax.annotation.Resource;
 import java.math.BigDecimal;
 import java.util.Collections;
-import java.util.Date;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Objects;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.stream.Collectors;
+import java.util.Set;
 
 /**
  * 流量上报控制器
@@ -53,18 +52,16 @@ public class FlowController extends BaseController {
     // 常量定义
     private static final String SUCCESS_RESPONSE = "ok";
     private static final String DEFAULT_USER_TUNNEL_ID = "0";
-    private static final long BYTES_TO_GB = 1024L * 1024L * 1024L;
-
-    // 用于同步相同用户和隧道的流量更新操作
-    private static final ConcurrentHashMap<String, Object> USER_LOCKS = new ConcurrentHashMap<>();
-    private static final ConcurrentHashMap<String, Object> TUNNEL_LOCKS = new ConcurrentHashMap<>();
-    private static final ConcurrentHashMap<String, Object> FORWARD_LOCKS = new ConcurrentHashMap<>();
-
-    // 缓存加密器实例，避免重复创建
-    private static final ConcurrentHashMap<String, AESCrypto> CRYPTO_CACHE = new ConcurrentHashMap<>();
+    // Fixed stripes preserve serialization without retaining historical IDs.
+    private static final Object[] USER_LOCKS = newLocks();
+    private static final Object[] TUNNEL_LOCKS = newLocks();
+    private static final Object[] FORWARD_LOCKS = newLocks();
 
     @Resource
     CheckGostConfigAsync checkGostConfigAsync;
+
+    @Resource
+    FlowLimitEnforcer flowLimitEnforcer;
 
     /**
      * 加密消息包装器
@@ -153,12 +150,19 @@ public class FlowController extends BaseController {
             return SUCCESS_RESPONSE;
         }
 
-        for (FlowDto flowData : flowDataList) {
-            if (Objects.equals(flowData.getN(), "web_api")) {
-                continue;
+        Set<String> affectedUsers = new HashSet<>();
+        try {
+            for (FlowDto flowData : flowDataList) {
+                if (Objects.equals(flowData.getN(), "web_api")) {
+                    continue;
+                }
+                log.info("节点上报流量数据{}", flowData);
+                String userId = processFlowData(flowData);
+                if (userId != null) affectedUsers.add(userId);
             }
-            log.info("节点上报流量数据{}", flowData);
-            processFlowData(flowData);
+        } finally {
+            // Earlier successful increments still need checking if a later record fails.
+            affectedUsers.forEach(flowLimitEnforcer::schedule);
         }
 
         return SUCCESS_RESPONSE;
@@ -225,7 +229,7 @@ public class FlowController extends BaseController {
      * 获取或创建加密器实例
      */
     private AESCrypto getOrCreateCrypto(String secret) {
-        return CRYPTO_CACHE.computeIfAbsent(secret, AESCrypto::create);
+        return EncryptionConfig.getOrCreateCrypto(secret);
     }
 
     /**
@@ -250,86 +254,7 @@ public class FlowController extends BaseController {
         updateUserFlow(userId, flowStats);
         updateUserTunnelFlow(userTunnelId, flowStats);
 
-        // 7. 检查和服务暂停操作
-        String name = buildServiceName(forwardId, userId, userTunnelId);
-        if (!Objects.equals(userTunnelId, DEFAULT_USER_TUNNEL_ID)) { // 非管理员的转发需要检测流量限制
-            checkUserRelatedLimits(userId, name);
-            checkUserTunnelRelatedLimits(userTunnelId, name, userId);
-        }
-
-        return SUCCESS_RESPONSE;
-    }
-
-    private void checkUserRelatedLimits(String userId, String name) {
-
-        // 重新查询用户以获取最新的流量数据
-        User updatedUser = userService.getById(userId);
-        if (updatedUser == null) return;
-
-        // 检查用户总流量限制
-        long userFlowLimit = updatedUser.getFlow() * BYTES_TO_GB;
-        long userCurrentFlow = updatedUser.getInFlow() + updatedUser.getOutFlow();
-        if (userFlowLimit < userCurrentFlow) {
-            pauseAllUserServices(userId, name);
-            return;
-        }
-
-        // 检查用户到期时间
-        if (updatedUser.getExpTime() != null && updatedUser.getExpTime() <= new Date().getTime()) {
-            pauseAllUserServices(userId, name);
-            return;
-        }
-
-        // 检查用户状态
-        if (updatedUser.getStatus() != 1) {
-            pauseAllUserServices(userId, name);
-        }
-    }
-
-    public void pauseAllUserServices(String userId, String name) {
-        List<Forward> forwardList = forwardService.list(new QueryWrapper<Forward>().eq("user_id", userId));
-        pauseService(forwardList, name);
-    }
-
-    public void checkUserTunnelRelatedLimits(String userTunnelId, String name, String userId) {
-
-        UserTunnel userTunnel = userTunnelService.getById(userTunnelId);
-        if (userTunnel == null) return;
-        long flow = userTunnel.getInFlow() + userTunnel.getOutFlow();
-        if (flow >= userTunnel.getFlow() *  BYTES_TO_GB) {
-            pauseSpecificForward(userTunnel.getTunnelId(), name, userId);
-            return;
-        }
-
-        if (userTunnel.getExpTime() != null && userTunnel.getExpTime() <= System.currentTimeMillis()) {
-            pauseSpecificForward(userTunnel.getTunnelId(), name, userId);
-            return;
-        }
-
-        if (userTunnel.getStatus() != 1) {
-            pauseSpecificForward(userTunnel.getTunnelId(), name, userId);
-        }
-
-
-    }
-
-    private void pauseSpecificForward(Integer tunnelId, String name, String userId) {
-        List<Forward> forwardList = forwardService.list(new QueryWrapper<Forward>().eq("tunnel_id", tunnelId).eq("user_id", userId));
-        pauseService(forwardList, name);
-    }
-
-    public void pauseService(List<Forward> forwardList, String name) {
-        for (Forward forward : forwardList) {
-            Tunnel tunnel = tunnelService.getById(forward.getTunnelId());
-            if (tunnel != null){
-                GostUtil.PauseService(tunnel.getInNodeId(), name);
-                if (tunnel.getType() == 2){
-                    GostUtil.PauseRemoteService(tunnel.getOutNodeId(), name);
-                }
-            }
-            forward.setStatus(0);
-            forwardService.updateById(forward);
-        }
+        return Objects.equals(userTunnelId, DEFAULT_USER_TUNNEL_ID) ? null : userId;
     }
 
     private FlowDto filterFlowData(FlowDto flowDto, Forward forward, int flowType) {
@@ -400,15 +325,15 @@ public class FlowController extends BaseController {
     }
 
     private Object getUserLock(String userId) {
-        return USER_LOCKS.computeIfAbsent(userId, k -> new Object());
+        return USER_LOCKS[Math.floorMod(userId.hashCode(), USER_LOCKS.length)];
     }
 
     private Object getTunnelLock(String userTunnelId) {
-        return TUNNEL_LOCKS.computeIfAbsent(userTunnelId, k -> new Object());
+        return TUNNEL_LOCKS[Math.floorMod(userTunnelId.hashCode(), TUNNEL_LOCKS.length)];
     }
 
     private Object getForwardLock(String forwardId) {
-        return FORWARD_LOCKS.computeIfAbsent(forwardId, k -> new Object());
+        return FORWARD_LOCKS[Math.floorMod(forwardId.hashCode(), FORWARD_LOCKS.length)];
     }
 
     private boolean isValidNode(String secret) {
@@ -420,7 +345,9 @@ public class FlowController extends BaseController {
         return serviceName.split("_");
     }
 
-    private String buildServiceName(String forwardId, String userId, String userTunnelId) {
-        return forwardId + "_" + userId + "_" + userTunnelId;
+    private static Object[] newLocks() {
+        Object[] locks = new Object[256];
+        for (int i = 0; i < locks.length; i++) locks[i] = new Object();
+        return locks;
     }
 }

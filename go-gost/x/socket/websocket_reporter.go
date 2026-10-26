@@ -100,6 +100,22 @@ type WebSocketReporter struct {
 	connecting     bool              // 新增：正在连接状态
 	connMutex      sync.Mutex        // 新增：连接状态锁
 	aesCrypto      *crypto.AESCrypto // 新增：AES加密器
+	startOnce      sync.Once
+	pingSlots      chan struct{}
+	commandSlot    chan struct{}
+}
+
+const (
+	maxConcurrentPings = 4
+	maxPingCount       = 10
+	maxPingTimeoutMS   = 5000
+	pingBudget         = 8 * time.Second
+)
+
+type reporterSession struct {
+	conn   *websocket.Conn
+	ctx    context.Context
+	cancel context.CancelFunc
 }
 
 // NewWebSocketReporter 创建一个新的WebSocket报告器
@@ -125,19 +141,24 @@ func NewWebSocketReporter(serverURL string, secret string) *WebSocketReporter {
 		connected:      false,
 		connecting:     false,
 		aesCrypto:      aesCrypto,
+		pingSlots:      make(chan struct{}, maxConcurrentPings),
+		commandSlot:    make(chan struct{}, 1),
 	}
 }
 
 // Start 启动WebSocket报告器
 func (w *WebSocketReporter) Start() {
-	go w.run()
+	w.startOnce.Do(func() { go w.run() })
 }
 
 // Stop 停止WebSocket报告器
 func (w *WebSocketReporter) Stop() {
 	w.cancel()
-	if w.conn != nil {
-		w.conn.Close()
+	w.connMutex.Lock()
+	conn := w.conn
+	w.connMutex.Unlock()
+	if conn != nil {
+		conn.Close()
 	}
 
 }
@@ -167,7 +188,10 @@ func (w *WebSocketReporter) run() {
 			}
 
 			// 连接成功，开始发送消息
-			if w.connected {
+			w.connMutex.Lock()
+			connected := w.connected
+			w.connMutex.Unlock()
+			if connected {
 				w.handleConnection()
 			} else {
 				// 如果连接失败，等待重试
@@ -221,10 +245,10 @@ func (w *WebSocketReporter) connect() error {
 		return fmt.Errorf("解析URL失败: %v", err)
 	}
 
-	dialer := websocket.DefaultDialer
+	dialer := *websocket.DefaultDialer
 	dialer.HandshakeTimeout = 10 * time.Second
 
-	conn, _, err := dialer.Dial(u.String(), nil)
+	conn, _, err := dialer.DialContext(w.ctx, u.String(), nil)
 	if err != nil {
 		return fmt.Errorf("连接WebSocket失败: %v", err)
 	}
@@ -238,33 +262,38 @@ func (w *WebSocketReporter) connect() error {
 	w.conn = conn
 	w.connected = true
 
-	// 设置关闭处理器来检测连接状态
-	w.conn.SetCloseHandler(func(code int, text string) error {
-		w.connMutex.Lock()
-		w.connected = false
-		w.connMutex.Unlock()
-		return nil
-	})
-
 	fmt.Printf("✅ WebSocket连接建立成功 (http=%d, tls=%d, socks=%d)\n", cfg.Http, cfg.Tls, cfg.Socks)
 	return nil
 }
 
 // handleConnection 处理WebSocket连接
 func (w *WebSocketReporter) handleConnection() {
+	w.connMutex.Lock()
+	conn := w.conn
+	w.connMutex.Unlock()
+	if conn == nil {
+		return
+	}
+	ctx, cancel := context.WithCancel(w.ctx)
+	session := &reporterSession{conn: conn, ctx: ctx, cancel: cancel}
+	conn.SetCloseHandler(func(code int, text string) error {
+		w.disconnect(session)
+		return nil
+	})
 	defer func() {
+		cancel()
+		conn.Close()
 		w.connMutex.Lock()
-		if w.conn != nil {
-			w.conn.Close()
+		if w.conn == conn {
 			w.conn = nil
+			w.connected = false
 		}
-		w.connected = false
 		w.connMutex.Unlock()
 		fmt.Printf("🔌 WebSocket连接已关闭\n")
 	}()
 
 	// 启动消息接收goroutine
-	go w.receiveMessages()
+	go w.receiveMessages(session)
 
 	// 主发送循环
 	ticker := time.NewTicker(w.pingInterval)
@@ -272,7 +301,7 @@ func (w *WebSocketReporter) handleConnection() {
 
 	for {
 		select {
-		case <-w.ctx.Done():
+		case <-ctx.Done():
 			return
 		case <-ticker.C:
 			// 检查连接状态
@@ -286,12 +315,21 @@ func (w *WebSocketReporter) handleConnection() {
 
 			// 获取系统信息并发送
 			sysInfo := w.collectSystemInfo()
-			if err := w.sendSystemInfo(sysInfo); err != nil {
+			if err := w.sendSystemInfo(session, sysInfo); err != nil {
 				fmt.Printf("❌ 发送系统信息失败: %v，准备重连\n", err)
 				return
 			}
 		}
 	}
+}
+
+func (w *WebSocketReporter) disconnect(session *reporterSession) {
+	session.cancel()
+	w.connMutex.Lock()
+	if w.conn == session.conn {
+		w.connected = false
+	}
+	w.connMutex.Unlock()
 }
 
 // collectSystemInfo 收集系统信息
@@ -310,11 +348,11 @@ func (w *WebSocketReporter) collectSystemInfo() SystemInfo {
 }
 
 // sendSystemInfo 发送系统信息
-func (w *WebSocketReporter) sendSystemInfo(sysInfo SystemInfo) error {
+func (w *WebSocketReporter) sendSystemInfo(session *reporterSession, sysInfo SystemInfo) error {
 	w.connMutex.Lock()
 	defer w.connMutex.Unlock()
 
-	if w.conn == nil || !w.connected {
+	if session.ctx.Err() != nil || w.conn != session.conn || !w.connected {
 		return fmt.Errorf("连接未建立")
 	}
 
@@ -354,6 +392,7 @@ func (w *WebSocketReporter) sendSystemInfo(sysInfo SystemInfo) error {
 
 	if err := w.conn.WriteMessage(websocket.TextMessage, messageData); err != nil {
 		w.connected = false // 标记连接已断开
+		session.cancel()
 		return fmt.Errorf("写入消息失败: %v", err)
 	}
 
@@ -361,20 +400,13 @@ func (w *WebSocketReporter) sendSystemInfo(sysInfo SystemInfo) error {
 }
 
 // receiveMessages 接收服务端发送的消息
-func (w *WebSocketReporter) receiveMessages() {
+func (w *WebSocketReporter) receiveMessages(session *reporterSession) {
+	conn := session.conn
 	for {
 		select {
-		case <-w.ctx.Done():
+		case <-session.ctx.Done():
 			return
 		default:
-			w.connMutex.Lock()
-			conn := w.conn
-			connected := w.connected
-			w.connMutex.Unlock()
-
-			if conn == nil || !connected {
-				return
-			}
 
 			// 设置读取超时
 			conn.SetReadDeadline(time.Now().Add(30 * time.Second))
@@ -384,20 +416,18 @@ func (w *WebSocketReporter) receiveMessages() {
 				if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
 					fmt.Printf("❌ WebSocket读取消息错误: %v\n", err)
 				}
-				w.connMutex.Lock()
-				w.connected = false
-				w.connMutex.Unlock()
+				w.disconnect(session)
 				return
 			}
 
 			// 处理接收到的消息
-			w.handleReceivedMessage(messageType, message)
+			w.handleReceivedMessage(session, messageType, message)
 		}
 	}
 }
 
 // handleReceivedMessage 处理接收到的消息
-func (w *WebSocketReporter) handleReceivedMessage(messageType int, message []byte) {
+func (w *WebSocketReporter) handleReceivedMessage(session *reporterSession, messageType int, message []byte) {
 	switch messageType {
 	case websocket.TextMessage:
 		// 先检查是否是加密消息
@@ -414,13 +444,13 @@ func (w *WebSocketReporter) handleReceivedMessage(messageType int, message []byt
 				decryptedData, err := w.aesCrypto.Decrypt(encryptedWrapper.Data)
 				if err != nil {
 					fmt.Printf("❌ 解密失败: %v\n", err)
-					w.sendErrorResponse("DecryptError", fmt.Sprintf("解密失败: %v", err))
+					w.sendErrorResponse(session, "DecryptError", fmt.Sprintf("解密失败: %v", err))
 					return
 				}
 				message = decryptedData
 			} else {
 				fmt.Printf("❌ 收到加密消息但没有加密器\n")
-				w.sendErrorResponse("NoDecryptor", "没有可用的解密器")
+				w.sendErrorResponse(session, "NoDecryptor", "没有可用的解密器")
 				return
 			}
 		}
@@ -440,7 +470,7 @@ func (w *WebSocketReporter) handleReceivedMessage(messageType int, message []byt
 			gzipReader, err := gzip.NewReader(bytes.NewReader(compressedMsg.Data))
 			if err != nil {
 				fmt.Printf("❌ 创建解压读取器失败: %v\n", err)
-				w.sendErrorResponse("DecompressError", fmt.Sprintf("解压失败: %v", err))
+				w.sendErrorResponse(session, "DecompressError", fmt.Sprintf("解压失败: %v", err))
 				return
 			}
 			defer gzipReader.Close()
@@ -448,7 +478,7 @@ func (w *WebSocketReporter) handleReceivedMessage(messageType int, message []byt
 			var decompressedData bytes.Buffer
 			if _, err := decompressedData.ReadFrom(gzipReader); err != nil {
 				fmt.Printf("❌ 解压数据失败: %v\n", err)
-				w.sendErrorResponse("DecompressError", fmt.Sprintf("解压失败: %v", err))
+				w.sendErrorResponse(session, "DecompressError", fmt.Sprintf("解压失败: %v", err))
 				return
 			}
 
@@ -461,23 +491,23 @@ func (w *WebSocketReporter) handleReceivedMessage(messageType int, message []byt
 			cmdMsg.RequestId = compressedMsg.RequestId
 			if err := json.Unmarshal(message, &cmdMsg.Data); err != nil {
 				fmt.Printf("❌ 解析解压后的命令数据失败: %v\n", err)
-				w.sendErrorResponse("ParseError", fmt.Sprintf("解析命令失败: %v", err))
+				w.sendErrorResponse(session, "ParseError", fmt.Sprintf("解析命令失败: %v", err))
 				return
 			}
 
 			if cmdMsg.Type != "call" {
-				w.routeCommand(cmdMsg)
+				w.routeCommand(session, cmdMsg)
 			}
 		} else {
 			// 处理普通消息
 			var cmdMsg CommandMessage
 			if err := json.Unmarshal(message, &cmdMsg); err != nil {
 				fmt.Printf("❌ 解析命令消息失败: %v\n", err)
-				w.sendErrorResponse("ParseError", fmt.Sprintf("解析命令失败: %v", err))
+				w.sendErrorResponse(session, "ParseError", fmt.Sprintf("解析命令失败: %v", err))
 				return
 			}
 			if cmdMsg.Type != "call" {
-				w.routeCommand(cmdMsg)
+				w.routeCommand(session, cmdMsg)
 			}
 		}
 
@@ -487,7 +517,25 @@ func (w *WebSocketReporter) handleReceivedMessage(messageType int, message []byt
 }
 
 // routeCommand 路由命令到对应的处理函数
-func (w *WebSocketReporter) routeCommand(cmd CommandMessage) {
+func (w *WebSocketReporter) routeCommand(session *reporterSession, cmd CommandMessage) {
+	if session.ctx.Err() != nil {
+		return
+	}
+	if cmd.Type == "TcpPing" {
+		w.startTcpPing(session, cmd)
+		return
+	}
+	// Keep configuration changes serial across reconnects. A reader from a
+	// cancelled session must leave this queue rather than execute stale work.
+	select {
+	case w.commandSlot <- struct{}{}:
+		defer func() { <-w.commandSlot }()
+	case <-session.ctx.Done():
+		return
+	}
+	if session.ctx.Err() != nil {
+		return
+	}
 	jsonBytes, errs := json.Marshal(cmd)
 	if errs != nil {
 		fmt.Println("Error marshaling JSON:", errs)
@@ -541,13 +589,6 @@ func (w *WebSocketReporter) routeCommand(cmd CommandMessage) {
 		err = w.handleDeleteLimiter(cmd.Data)
 		response.Type = "DeleteLimitersResponse"
 
-	// TCP Ping 诊断命令
-	case "TcpPing":
-		var tcpPingResult TcpPingResponse
-		tcpPingResult, err = w.handleTcpPing(cmd.Data)
-		response.Type = "TcpPingResponse"
-		response.Data = tcpPingResult
-
 	// Protocol blocking switches
 	case "SetProtocol":
 		err = w.handleSetProtocol(cmd.Data)
@@ -569,7 +610,28 @@ func (w *WebSocketReporter) routeCommand(cmd CommandMessage) {
 		response.Message = "OK"
 	}
 
-	w.sendResponse(response)
+	w.sendResponse(session, response)
+}
+
+func (w *WebSocketReporter) startTcpPing(session *reporterSession, cmd CommandMessage) {
+	select {
+	case w.pingSlots <- struct{}{}:
+		go func() {
+			defer func() { <-w.pingSlots }()
+			ctx, cancel := context.WithTimeout(session.ctx, pingBudget)
+			defer cancel()
+			result, err := w.handleTcpPing(ctx, cmd.Data)
+			response := CommandResponse{Type: "TcpPingResponse", RequestId: cmd.RequestId,
+				Success: err == nil, Message: "OK", Data: result}
+			if err != nil {
+				response.Message = err.Error()
+			}
+			w.sendResponse(session, response)
+		}()
+	default:
+		w.sendResponse(session, CommandResponse{Type: "TcpPingResponse", RequestId: cmd.RequestId,
+			Success: false, Message: "too many concurrent TCP diagnostics"})
+	}
 }
 
 // Service 命令处理函数
@@ -911,11 +973,11 @@ func (w *WebSocketReporter) handleCall(data interface{}) error {
 }
 
 // sendResponse 发送响应消息到服务端
-func (w *WebSocketReporter) sendResponse(response CommandResponse) {
+func (w *WebSocketReporter) sendResponse(session *reporterSession, response CommandResponse) {
 	w.connMutex.Lock()
 	defer w.connMutex.Unlock()
 
-	if w.conn == nil || !w.connected {
+	if session.ctx.Err() != nil || w.conn != session.conn || !w.connected {
 		fmt.Printf("❌ 无法发送响应：连接未建立\n")
 		return
 	}
@@ -966,17 +1028,18 @@ func (w *WebSocketReporter) sendResponse(response CommandResponse) {
 	if err := w.conn.WriteMessage(websocket.TextMessage, messageData); err != nil {
 		fmt.Printf("❌ 发送响应失败: %v\n", err)
 		w.connected = false
+		session.cancel()
 	}
 }
 
 // sendErrorResponse 发送错误响应
-func (w *WebSocketReporter) sendErrorResponse(responseType, message string) {
+func (w *WebSocketReporter) sendErrorResponse(session *reporterSession, responseType, message string) {
 	response := CommandResponse{
 		Type:    responseType,
 		Success: false,
 		Message: message,
 	}
-	w.sendResponse(response)
+	w.sendResponse(session, response)
 }
 
 // getUptime 获取系统开机时间（秒）
@@ -1057,7 +1120,7 @@ func StartWebSocketReporterWithConfig(addr string, secret string, http int, tls 
 }
 
 // handleTcpPing 处理TCP ping诊断命令
-func (w *WebSocketReporter) handleTcpPing(data interface{}) (TcpPingResponse, error) {
+func (w *WebSocketReporter) handleTcpPing(ctx context.Context, data interface{}) (TcpPingResponse, error) {
 	jsonData, err := json.Marshal(data)
 	if err != nil {
 		return TcpPingResponse{}, fmt.Errorf("序列化TCP ping数据失败: %v", err)
@@ -1097,9 +1160,12 @@ func (w *WebSocketReporter) handleTcpPing(data interface{}) (TcpPingResponse, er
 	if req.Timeout <= 0 {
 		req.Timeout = 5000 // 默认5秒超时
 	}
+	if req.Count > maxPingCount || req.Timeout > maxPingTimeoutMS {
+		return TcpPingResponse{}, fmt.Errorf("TCP ping count must be <= %d and timeout <= %dms", maxPingCount, maxPingTimeoutMS)
+	}
 
 	// 执行TCP ping操作
-	avgTime, packetLoss, err := tcpPingHost(req.IP, req.Port, req.Count, req.Timeout)
+	avgTime, packetLoss, err := tcpPingHost(ctx, req.IP, req.Port, req.Count, req.Timeout)
 
 	response := TcpPingResponse{
 		IP:        req.IP,
@@ -1120,7 +1186,7 @@ func (w *WebSocketReporter) handleTcpPing(data interface{}) (TcpPingResponse, er
 }
 
 // tcpPingHost 执行TCP连接测试，返回平均连接时间和失败率
-func tcpPingHost(ip string, port int, count int, timeoutMs int) (float64, float64, error) {
+func tcpPingHost(ctx context.Context, ip string, port int, count int, timeoutMs int) (float64, float64, error) {
 	var totalTime float64
 	var successCount int
 
@@ -1138,7 +1204,7 @@ func tcpPingHost(ip string, port int, count int, timeoutMs int) (float64, float6
 		fmt.Printf("🔍 检测到域名，正在解析DNS...\n")
 		dnsStart := time.Now()
 
-		addrs, err := net.LookupHost(ip)
+		addrs, err := net.DefaultResolver.LookupHost(ctx, ip)
 		dnsDuration := time.Since(dnsStart)
 
 		if err != nil {
@@ -1159,10 +1225,13 @@ func tcpPingHost(ip string, port int, count int, timeoutMs int) (float64, float6
 	}
 
 	for i := 0; i < count; i++ {
+		if err := ctx.Err(); err != nil {
+			return 0, 100, err
+		}
 		start := time.Now()
 
 		// 创建带超时的TCP连接
-		conn, err := net.DialTimeout("tcp", target, timeout)
+		conn, err := (&net.Dialer{Timeout: timeout}).DialContext(ctx, "tcp", target)
 
 		elapsed := time.Since(start)
 
@@ -1177,7 +1246,11 @@ func tcpPingHost(ip string, port int, count int, timeoutMs int) (float64, float6
 
 		// 如果不是最后一次，等待一下再进行下次测试
 		if i < count-1 {
-			time.Sleep(100 * time.Millisecond)
+			select {
+			case <-time.After(100 * time.Millisecond):
+			case <-ctx.Done():
+				return 0, 100, ctx.Err()
+			}
 		}
 	}
 

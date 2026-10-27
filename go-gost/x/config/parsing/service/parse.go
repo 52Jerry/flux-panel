@@ -30,6 +30,7 @@ import (
 	hop_parser "github.com/go-gost/x/config/parsing/hop"
 	logger_parser "github.com/go-gost/x/config/parsing/logger"
 	selector_parser "github.com/go-gost/x/config/parsing/selector"
+	"github.com/go-gost/x/internal/net/dialer"
 	tls_util "github.com/go-gost/x/internal/util/tls"
 	cache_limiter "github.com/go-gost/x/limiter/traffic/cache"
 	"github.com/go-gost/x/metadata"
@@ -150,6 +151,10 @@ func ParseService(cfg *config.ServiceConfig) (service.Service, error) {
 		limiterRefreshInterval = mdutil.GetDuration(md, parsing.MDKeyLimiterRefreshInterval)
 		limiterCleanupInterval = mdutil.GetDuration(md, parsing.MDKeyLimiterCleanupInterval)
 		limiterScope = mdutil.GetString(md, parsing.MDKeyLimiterScope)
+	}
+
+	if err := dialer.ValidateSourcePool(ifce); err != nil {
+		return nil, fmt.Errorf("service %s: %w", cfg.Name, err)
 	}
 
 	if enableStats {

@@ -14,9 +14,11 @@ import (
 )
 
 type metadata struct {
-	readTimeout   time.Duration
-	writeTimeout  time.Duration
-	httpKeepalive bool
+	readTimeout         time.Duration
+	writeTimeout        time.Duration
+	tcpBufferSize       int
+	tcpSocketBufferSize int
+	httpKeepalive       bool
 
 	sniffing                    bool
 	sniffingTimeout             time.Duration
@@ -31,6 +33,14 @@ type metadata struct {
 
 func (h *forwardHandler) parseMetadata(md mdata.Metadata) (err error) {
 	h.md.writeTimeout, err = xnet.TransportTimeout(md, "writeTimeout", xnet.DefaultWriteTimeout)
+	if err != nil {
+		return err
+	}
+	h.md.tcpBufferSize, err = xnet.TransportBufferSize(md, "tcp.bufferSize")
+	if err != nil {
+		return err
+	}
+	h.md.tcpSocketBufferSize, err = xnet.TransportBufferSize(md, "tcp.socketBufferSize")
 	if err != nil {
 		return err
 	}

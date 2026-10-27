@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"net"
 	"time"
 
@@ -224,9 +225,15 @@ func (h *forwardHandler) Handle(ctx context.Context, conn net.Conn, opts ...hand
 	}
 	defer cc.Close()
 
-	xnet.TransportWithOptions(conn, cc, xnet.TransportOptions{WriteTimeout: h.md.writeTimeout})
-
-	return nil
+	err = xnet.TransportWithOptions(conn, cc, xnet.TransportOptions{
+		WriteTimeout: h.md.writeTimeout, TCPBufferSize: h.md.tcpBufferSize, TCPSocketBufferSize: h.md.tcpSocketBufferSize,
+	})
+	// Closing the peer after EOF is normal transport cleanup. Preserve real
+	// timeout/reset/configuration errors so disconnect reasons reach the recorder.
+	if errors.Is(err, net.ErrClosed) || errors.Is(err, io.ErrClosedPipe) {
+		err = nil
+	}
+	return err
 }
 
 func (h *forwardHandler) checkRateLimit(addr net.Addr) bool {

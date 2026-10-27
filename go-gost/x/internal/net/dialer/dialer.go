@@ -81,7 +81,11 @@ func (d *Dialer) Dial(ctx context.Context, network, addr string) (conn net.Conn,
 	default:
 	}
 
-	ifces := strings.Split(d.Interface, ",")
+	ifces, err := sourceInterfaces(d.Interface, network, addr)
+	if err != nil {
+		return nil, err
+	}
+	pooled := strings.HasPrefix(d.Interface, "pool:")
 	for _, ifce := range ifces {
 		strict := strings.HasSuffix(ifce, "!")
 		ifce = strings.TrimSuffix(ifce, "!")
@@ -100,7 +104,7 @@ func (d *Dialer) Dial(ctx context.Context, network, addr string) (conn net.Conn,
 
 			log.Debugf("dial %s %v@%s failed: %s", network, ifAddr, ifceName, err)
 
-			if strict &&
+			if strict && !pooled &&
 				!strings.Contains(err.Error(), "no suitable address found") &&
 				!strings.Contains(err.Error(), "mismatched local address type") {
 				return

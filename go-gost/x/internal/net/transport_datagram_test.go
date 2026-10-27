@@ -44,7 +44,7 @@ func TestStreamMemoryOptimizationPreservesLargeDatagrams(t *testing.T) {
 	source := &transportDatagram{payload: payload, closed: make(chan struct{})}
 	target := &transportDatagram{closed: make(chan struct{})}
 	// Completion waits for both workers, so inspecting written is synchronized.
-	_ = TransportWithOptions(source, target, TransportOptions{})
+	_ = TransportWithOptions(source, target, TransportOptions{TCPBufferSize: 4096})
 	if !bytes.Equal(target.written, payload) {
 		t.Fatalf("datagram was truncated: received %d of %d bytes", len(target.written), len(payload))
 	}

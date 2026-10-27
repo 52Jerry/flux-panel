@@ -20,6 +20,13 @@ const streamBufferSize = 32 * 1024
 const DefaultWriteTimeout = 60 * time.Second
 
 type TransportOptions struct {
+	// TCPBufferSize bounds each stream copy buffer. Zero keeps the default.
+	// Datagram/unknown endpoints always retain the full-size datagram buffer.
+	TCPBufferSize int
+	// TCPSocketBufferSize bounds native kernel send/receive queues on both
+	// endpoints. Zero preserves operating-system autotuning. Linux doubles the
+	// requested SO_RCVBUF/SO_SNDBUF size for accounting overhead.
+	TCPSocketBufferSize int
 	// WriteTimeout bounds a pending network write without progress. Zero disables
 	// it; a connection waiting for application data has no pending write.
 	WriteTimeout time.Duration
@@ -67,6 +74,25 @@ func TransportWithOptions(rw1, rw2 io.ReadWriter, opts TransportOptions) error {
 	size := bufferSize
 	if streamEndpoint(rw1) && streamEndpoint(rw2) {
 		size = streamBufferSize
+		if opts.TCPBufferSize != 0 {
+			if opts.TCPBufferSize < 4096 || opts.TCPBufferSize > bufferSize {
+				closeBoth()
+				return errors.New("TCP buffer size must be between 4096 and 65536 bytes")
+			}
+			size = opts.TCPBufferSize
+		}
+		if opts.TCPSocketBufferSize != 0 {
+			if opts.TCPSocketBufferSize < 4096 || opts.TCPSocketBufferSize > bufferSize {
+				closeBoth()
+				return errors.New("TCP socket buffer size must be between 4096 and 65536 bytes")
+			}
+			for _, rw := range []io.ReadWriter{rw1, rw2} {
+				if err := setTCPSocketBuffers(rw, opts.TCPSocketBufferSize); err != nil {
+					closeBoth()
+					return err
+				}
+			}
+		}
 	}
 	copyOne := func(dst io.Writer, src io.Reader) {
 		err := copyTransport(dst, src, writeOpts, idle.progress, size)

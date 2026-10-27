@@ -1,0 +1,79 @@
+VLESS 吞吐优化部署记录（2026-10-27，时间为北京时间）
+
+当前上线状态
+1. 深圳 20168 的所有新 TCP 连接进入 niusu-vless-bbr-full-20261027。
+   内部监听 24168，仍透明转发到既有香港 VLESS，不修改客户端配置。
+   该入口显式选择内核 BBR；深圳系统默认算法仍为 cubic。
+   原入口 PID 813481 保留旧连接与回退能力，没有重启。
+   10% 试验入口 23168 已停止接收新连接；仅在业务连接为零并安静 90 秒后回收。
+2. 深圳公网 ens18 使用 FQ，limit=10000、flow_limit=100、buckets=16384。
+   香港原有 BBR/FQ 继续保留。深圳内网队列未改动。
+3. 两端公网接收分流已启用：深圳掩码 ff、香港 ffff；公共 RFS 表和
+   ens18 单接收队列流表各 65536。内网 RFS 表设为 0，避免开启公共表时
+   连带激活此前预留、但没有使用的内网流表。
+4. 香港代际数由 8 持续增长到 26，可用内存一度约 1.8 GiB 并持续换出。
+   在既有配置锁和发布锁内，仅将 reserveBytes 从 1 GiB 改为 3 GiB，
+   candidateBudgetBytes 保持 1 GiB。创建新代际前须有至少 4 GiB 可用内存。
+   未停止或重启现有香港核心；代际数随后稳定在 26，14:55 采样换出为 0。
+   此保护可能暂缓/拒绝新增和修改账号的配置发布；已发布账号与连接继续工作。
+   没有修改另一会话管理的 Node Manager 应用源文件。
+
+按监听器选择拥塞控制
+配置位于 service.listener.metadata，不是 handler.metadata：
+  "listener": {
+    "type": "tcp",
+    "metadata": {"tcp.congestionControl": "bbr"}
+  }
+省略字段保留原平台默认行为。支持 reno/cubic/bbr；非字符串和未知值拒绝。
+Linux 在 bind/listen 前设置 TCP_CONGESTION，接受连接继承这个选择。
+明确指定但内核不支持时初始化失败，不静默回退；非 Linux 明确指定也报错。
+这一字段不改变转发器到香港的拨号算法，不改变其他服务的监听器。
+
+正式入口资源与持久化
+GOMAXPROCS=6，GOMEMLIMIT=2GiB，CPUQuota=600%，MemoryHigh=2500M，
+MemoryMax=3500M，FD=262144。复制缓冲仍每方向 4 KiB，内核缓冲请求仍 64 KiB，
+保留原统计服务名、流量上报和八个源 IP。
+二进制 SHA256：42631f0335cef4cf1703cf1a12cd521f9c47522e92843dfffa8be8120b4362be。
+部署位置：/opt/niusu-vless-bbr-full-20261027/flux-gost。
+已启用：niusu-vless-bbr-full-20261027.service、对应 routing.service、
+niusu-public-fq-20261027.service、两端 niusu-receive-scaling-20261027.service。
+tcp_bbr 的开机加载配置位于 /etc/modules-load.d/niusu-vless-bbr-20261027.conf。
+临时试验回滚计时器均已停止。脚本修复了 Windows CRLF 入口兼容问题，
+最终直接执行路由助手、路由匹配和监听算法均已核实。
+RPS/RFS 脚本校验原值、拓扑与外部修改；仅在新一次启动时接受内核清零，
+成功应用后更新启动标识，防止覆盖同一次启动内管理员主动关闭的设置。
+
+验证与实际限制
+- x 模块和主模块全部 Go 测试通过；Linux 内核测试验证监听算法继承、
+  不可用算法拒绝启动；8 条小连接确认接受端为 BBR。没有生产容量压测。
+- RPS/RFS 的应用/恢复、外部修改保护、启动清零、写入失败恢复、拓扑变化
+  五项 Python 测试通过：PYTHONDONTWRITEBYTECODE=1 python go-gost/scripts/test_receive_scaling.py。
+- 10% -> 50% -> 全部新连接分批上线；旧连接不强制重连。
+- 14:55 深圳公网发送约 451.8 Mbps，此前采样约 343–360 Mbps；这是网卡
+  发送量，包含重传，不能当作用户净速提升比例，也不是严格相同负载比较。
+- 14:57 存续连接采样：BBR 组活跃下载速率 P95 约 794 Kbps，旧入口约
+  341 Kbps；同时有两组活跃连接的 72 个客户端 IP，其每连接平均有效传输
+  速率比值的中位数约 2.31。两组连接寿命、目标、需求不一致，不能保证
+  所有用户都有相同提升，采样也漏掉窗口内新建后又关闭的短连接。
+- 重传没有修复：14:55 深圳整机 TCP 重传段占比约 9.79%，早先约 4.40%。
+  14:57 BBR 组重传字节占已发字节约 22.45%，旧入口约 17.42%。
+  这些百分比口径不同，不能混用；入口提速伴随了更高的重传开销。
+  仍需核对深圳客户端方向的丢包/限速，不能宣称公网问题完全修复。
+- 14:55 香港最忙核心约 66%，可用内存约 2.54 GiB，代际数 26、状态 steady。
+  深圳可用内存约 4.55 GiB，正式入口无重启。套接字数不是独立用户数。
+  未完成万人真实并发容量验收，不能用连接准入上限替代容量结论。
+
+回滚
+先执行 systemctl disable --now niusu-vless-bbr-full-20261027-routing.service。
+只撤销本次新连接规则，回到原 cubic 入口；保持 BBR 进程存活排空现有连接。
+FQ 单独回滚：systemctl disable --now niusu-public-fq-20261027.service。
+RPS/RFS 单独回滚：systemctl disable --now niusu-receive-scaling-20261027.service。
+深圳之前的 niusu-vless-rps-20261027.service 仍独立保留公网 RPS。
+香港内存门槛回滚须持有两个既有配置锁，仅恢复 reserveBytes 这一字段，
+不要整文件覆盖后来可能发生的配置修改。原值备份保存在服务器
+/root/backups/flux-receive-scaling-20261027/publication-spec-before-memory-reserve.json。
+
+官方技术依据
+https://www.kernel.org/doc/html/latest/networking/scaling.html
+https://www.kernel.org/doc/html/next/networking/ip-sysctl.html
+https://github.com/google/bbr/blob/master/Documentation/bbr-quick-start.md

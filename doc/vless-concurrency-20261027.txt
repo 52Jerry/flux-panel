@@ -29,6 +29,33 @@ VLESS 公网发送队列                   110 MiB            42 MiB
 深圳已用物理内存                     约3.36 GiB         约2.36 GiB
 仍有公网重传和超时，不能将“有改善”描述为“所有网络问题均已修复”。
 
+14:08–14:21 CST 普遍降速复查与接收处理分流
+- 深圳 ens18、ens19 都只有一个硬件接收队列，RPS 掩码原为 0。
+  14:08 的 CPU5 忙碌 96.34%，其中软中断 89.84%；整机 CPU 68.92%，
+  可用内存约 4.83 GiB，无内存压力，监听队列未溢出。
+- 热试验先启用两张网卡的 RPS，再缩小到公网 ens18；内网 ens19 恢复原值。
+  双网卡分流增加了总 CPU 开销，因此未保留内网调整。
+  公网网卡按连接散列到 8 核；不重启 GOST，不改变转发、路由或 TCP 算法。
+- 关闭公网分流的回退采样中 CPU5 又升至 76.41%，其软中断 58.85%；
+  保留公网分流后的末次采样，最忙核心为 74.11%，整机 CPU 62.09%。
+  实际流量持续变化，不能将这些数值当成严格吞吐 A/B 或用户测速结果。
+- 最终配置 /sys/class/net/ens18/queues/rx-0/rps_cpus = ff，
+  ens19 = 0。服务 niusu-vless-rps-20261027.service 已启用，开机应用。
+  ExecStart/ExecStop 调用 go-gost/scripts/vless-rps.py 对应的部署副本：
+  /usr/local/sbin/niusu-vless-rps-20261027，原值保存在
+  /root/backups/flux-rps-20261027/before.json。
+  脚本限定已核实的 8 核单接收队列拓扑；若检测到他人改动则拒绝覆盖。
+  回滚：systemctl disable --now niusu-vless-rps-20261027.service。
+  已验证 VLESS 进程 PID 813481 未变，旧连接持续存在；未做容量压测。
+- 14:21 最终采样中 TCP 重传仍约 4.40%，因此尚未确认整体网速恢复。
+  存续 VLESS 公网连接重传约 1.187 MiB/s，内部连接约 0.001 MiB/s；
+  香港活动代际到入口发送队列约 113.7 MiB，住宅出口接收队列约 321.7 MiB。
+  这些队列符合客户端方向受阻后的反压；不能把队列所在进程直接判为根因。
+  下一步应针对深圳客户端方向核对运营商丢包/限速、虚拟网卡多队列能力，
+  并结合相同时段指标定位；仅增加 sing-box 进程不会消除这段 TCP 重传。
+- RPS 的适用条件与额外 IPI 开销参考 Linux 内核官方文档：
+  https://www.kernel.org/doc/html/latest/networking/scaling.html
+
 已查明的独立断连原因
 1. 当前 sing-box 1.13.18 的 systemd ExecReload 是 kill -HUP。
    官方 CLI 收到 HUP 后关闭整个 Box 再创建；PID 不变也会中断原连接。
